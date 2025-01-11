@@ -1,0 +1,10 @@
+*.swo
+*.swp
+**/*.rs.bk
+*.pyc
+.vscode
+**/.vscode/*
+**/.vscode/settings.json
+*.DS_Store
+.mypy_cache
+.venv
