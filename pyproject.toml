@@ -1,0 +1,18 @@
+[project]
+name = "ulcli"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "flatbuffers==23.5.26",
+    "loguru==0.6.0",
+    "pyarrow==17.0.0",
+    "python-magic>=0.4.27",
+    "tabulate==0.8.10",
+    "termcolor==2.0.1",
+    "ulsdk",
+]
+
+[tool.uv.sources]
+ulsdk = { git = "https://github.com/urbanlogiq/ulsdk" }
