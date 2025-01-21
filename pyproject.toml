@@ -16,3 +16,16 @@ dependencies = [
 
 [tool.uv.sources]
 ulsdk = { git = "https://github.com/urbanlogiq/ulsdk" }
+
+[tool.pyright]
+reportMissingImports = true
+# If you add a new dependency that has no type stubs available,
+# you can generate them by running `pyright --createstub <package-name>`
+# then they will appear in the /typings directory, where you can edit them if needed.
+reportMissingTypeStubs = true
+reportUntypedClassDecorator = true
+pythonVersion = "3.12"
+stubPath = "typings"
+executionEnvironments = [
+  { root = "." },
+]
