@@ -273,7 +273,7 @@ requires-dist = [
 [[package]]
 name = "ulsdk"
 version = "0.1.0"
-source = { git = "https://github.com/urbanlogiq/ulsdk#1ff5b310da3b38c1a3d3f5571ad7faee8c57b20e" }
+source = { git = "https://github.com/urbanlogiq/ulsdk#ae631eea93200b45fcaefd9f912d2fab09d20067" }
 dependencies = [
     { name = "flatbuffers" },
     { name = "pyarrow" },
