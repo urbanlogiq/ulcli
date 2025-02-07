@@ -79,7 +79,8 @@ def drive_ls(args: List[str]):
         results += roots.slots
 
     for path in parsed.paths:
-        print(f"Gathering {path}", end="\r")
+        status_msg = f"Gathering {path}"
+        print(status_msg, end="\r")
 
         if parsed.union:
             res = ls(context, "union", path)
@@ -99,7 +100,7 @@ def drive_ls(args: List[str]):
             results += res.slots
 
         # clear the line of all the "gathering" text
-        print(" " * (len(path) + 10), end="\r")
+        print(" " * len(status_msg), end="\r")
 
     table = map(parse_slot, results)
     print(
