@@ -98,6 +98,9 @@ def drive_ls(args: List[str]):
             res = ls(context, root, path)
             results += res.slots
 
+        # clear the line of all the "gathering" text
+        print(" " * (len(path) + 10), end="\r")
+
     table = map(parse_slot, results)
     print(
         tabulate(table, headers=["Type", "Permissions", "Time", "Size", "Id", "Name"])
