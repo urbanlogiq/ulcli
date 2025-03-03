@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-ulsdk = { git = "https://github.com/urbanlogiq/ulsdk", rev = "9d7a8af65ae3f5ca29c650e1773c197001de5d7a" }
+ulsdk = { git = "https://github.com/urbanlogiq/ulsdk", rev = "ec333cafc4e9a05770a36489b9e4b7b6cc9a7da9" }
 
 [tool.pyright]
 reportMissingImports = true
