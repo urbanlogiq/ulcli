@@ -1,5 +1,4 @@
 version = 1
-revision = 1
 requires-python = ">=3.12"
 
 [[package]]
@@ -268,13 +267,13 @@ requires-dist = [
     { name = "python-magic", specifier = ">=0.4.27" },
     { name = "tabulate", specifier = "==0.8.10" },
     { name = "termcolor", specifier = "==2.0.1" },
-    { name = "ulsdk", git = "https://github.com/urbanlogiq/ulsdk?rev=ec333cafc4e9a05770a36489b9e4b7b6cc9a7da9" },
+    { name = "ulsdk", git = "https://github.com/urbanlogiq/ulsdk" },
 ]
 
 [[package]]
 name = "ulsdk"
 version = "0.1.0"
-source = { git = "https://github.com/urbanlogiq/ulsdk?rev=ec333cafc4e9a05770a36489b9e4b7b6cc9a7da9#ec333cafc4e9a05770a36489b9e4b7b6cc9a7da9" }
+source = { git = "https://github.com/urbanlogiq/ulsdk#e43923307cdcea08aa7fc13c9a30034bce03d98c" }
 dependencies = [
     { name = "flatbuffers" },
     { name = "pyarrow" },
