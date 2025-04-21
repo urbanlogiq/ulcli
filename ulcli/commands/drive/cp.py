@@ -31,7 +31,7 @@ from ulsdk.api.drive import (
     put_file_chunk,
 )
 
-from .utils import parse_timestamp_arg, timestamp_in_range
+from .utils import parse_timestamp_arg, timestamp_in_range, is_directory_entry_id
 
 
 CHUNK_SIZE = 96 * 1024 * 1024
@@ -196,14 +196,6 @@ class LocalEntry(Entry):
         path = os.path.join(self._path, dir)
         os.mkdir(path)
         return LocalEntry(path)
-
-
-def is_directory_entry_id(id: str) -> bool:
-    try:
-        assert uuid.UUID(id)
-    except Exception:
-        return False
-    return id.startswith("0500")
 
 
 def get_dir_list_slot(context: RequestContext, id_str: str) -> DriveEntry:
