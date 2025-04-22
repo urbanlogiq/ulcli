@@ -7,6 +7,7 @@ Shared functions for the drive commands
 import datetime
 import re
 from typing import Any
+from uuid import UUID
 
 
 def parse_timestamp_arg(arg: Any) -> int | None:
@@ -31,3 +32,11 @@ def timestamp_in_range(
     if latest_timestamp is not None and ts > latest_timestamp:
         return False
     return True
+
+
+def is_directory_entry_id(id: str) -> bool:
+    try:
+        assert UUID(id)
+    except Exception:
+        return False
+    return id.startswith("0500")
