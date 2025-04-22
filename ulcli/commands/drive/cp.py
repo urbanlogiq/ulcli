@@ -29,6 +29,7 @@ from ulsdk.api.drive import (
     create_entry,
     post_file,
     put_file_chunk,
+    unlink,
 )
 
 from .utils import parse_timestamp_arg, timestamp_in_range, is_directory_entry_id
@@ -102,7 +103,13 @@ def mk_dir(context: RequestContext, parent: uuid.UUID, dir: str) -> ObjectId:
     return summary.id
 
 
-class DriveEntry(Entry):
+class Removable(ABC):
+    @abstractmethod
+    def rm(self):
+        """Remove the entry from the drive"""
+
+
+class DriveEntry(Entry, Removable):
     _oid: uuid.UUID
 
     def __init__(self, context: RequestContext, slot: ListSlot):
@@ -164,6 +171,9 @@ class DriveEntry(Entry):
                 return entry
 
         raise Exception("Created directory was not in directory listing")
+
+    def rm(self):
+        unlink(self._context, str(self._oid))
 
 
 class LocalEntry(Entry):
