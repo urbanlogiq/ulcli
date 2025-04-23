@@ -14,13 +14,14 @@ from .cp import get_dir_list_slot, DriveEntry
 
 
 def do_rm_r(context: RequestContext, source: DriveEntry) -> bool:
-    src_entries = source.collect()
-    for src in src_entries:
-        if src.isdir():
+    if source.isdir():
+        logger.info(f"Deleting all content for directory: {source.name()}")
+        src_entries = source.collect()
+        for src in src_entries:
             do_rm_r(context, src)
-        else:
-            logger.info(f"Deleting {src.name()}")
-            src.rm()
+    else:
+        logger.info(f"Deleting {source.name()}")
+        source.rm()
     return True
 
 
@@ -80,11 +81,14 @@ def drive_rm(args: List[str]) -> bool:
     parsed = parser.parse_args(args)
     context = get_api_context(parsed)
     files = parsed.files
-    logger.info(f"Parsed files: {files}")
 
     if len(files) != 1:
         raise ValueError("Only one file/directory pattern is allowed; you supplied more than one.")
-    entries = parse_pattern(context, files[0])
+    pattern = files[0]
+    status_msg = f"Gathering {pattern}"
+    print(status_msg, end="\r")
+
+    entries = parse_pattern(context, pattern)
 
     # non‑empty directory & recursive
     # -> delete all content (files/sudirs)
