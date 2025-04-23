@@ -1,4 +1,5 @@
 # Copyright (c), CommunityLogiq Software
+import argparse
 import urllib.parse
 import ulcli.argparser
 
@@ -15,7 +16,7 @@ from .cp import get_dir_list_slot, DriveEntry
 def do_rm_r(context: RequestContext, source: DriveEntry) -> bool:
     src_entries = source.collect()
     for src in src_entries:
-        if src.isdir(): 
+        if src.isdir():
             do_rm_r(context, src)
         else:
             logger.info(f"Deleting {src.name()}")
@@ -59,10 +60,17 @@ def parse_pattern(context: RequestContext, pattern: str) -> List[DriveEntry]:
 
 
 def drive_rm(args: List[str]) -> bool:
+    epilog = """Example:
+    ul drive rm -profile us '050040d2-6a9e-344c-4dfa-93c18ad2bfaa:/Dataset upload folder/*'
+    """
+
     parser = ulcli.argparser.ArgumentParser(
-        prog="ul drive rm", description="Remove files/directories from the Drive"
+        prog="ul drive rm",
+        description="Remove files/directories from the drive",
+        epilog=epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("-r", help="recursively delete all subdirectories")
+    parser.add_argument("-r", help="recursively remove all subdirectories")
     parser.add_argument(
         "files",
         nargs="+",
@@ -72,7 +80,8 @@ def drive_rm(args: List[str]) -> bool:
     parsed = parser.parse_args(args)
     context = get_api_context(parsed)
     files = parsed.files
-    entries = parse_pattern(context, files)
+    logger.info(f"Parsed files: {files}")
+    entries = parse_pattern(context, files[0])
 
     # non‑empty directory & recursive
     # -> delete all content (files/sudirs)
