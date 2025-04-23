@@ -17,9 +17,9 @@ def do_rm_r(context: RequestContext, source: DriveEntry) -> bool:
     if source.isdir():
         src_entries = source.collect()
         if len(src_entries) == 0:
-            logger.info(f"Directory {source.name()} is already empty")
+            logger.info(f"Nothing to delete: '{source.name()}' is already empty")
             return True
-        logger.info(f"Deleting all content for directory: {source.name()}")
+        logger.info(f"Deleting all content for directory '{source.name()}'")
         for src in src_entries:
             do_rm_r(context, src)
     else:
@@ -79,13 +79,13 @@ def drive_rm(args: List[str]) -> bool:
     parser.add_argument("-r", help="recursively remove all subdirectories", action="store_true")
     parser.add_argument(
         "-start",
-        help="Earliest last modified date of files to remove. Format: unix millisecond or YYYY-MM-DD string (midnight local time)",
+        help="Earliest last modified date of files to remove. Format: unix second or YYYY-MM-DD string (midnight local time)",
         type=str,
         default=None,
     )
     parser.add_argument(
         "-end",
-        help="Latest last modified date of files to remove. Format: unix millisecond or YYYY-MM-DD string (midnight local time)",
+        help="Latest last modified date of files to remove. Format: unix second or YYYY-MM-DD string (midnight local time)",
         type=str,
         default=None,
     )
@@ -108,6 +108,8 @@ def drive_rm(args: List[str]) -> bool:
     entries = parse_pattern(context, pattern)
 
     # parse start & end args
+    logger.info(f"Timestamps: {parsed.start}, {parsed.end}")
+    logger.info(f"Timestamps types: {type(parsed.start)}, {type(parsed.end)}")
     earliest = parse_timestamp_arg(parsed.start)
     latest = parse_timestamp_arg(parsed.end)
     if earliest is not None and latest is not None and earliest > latest:
