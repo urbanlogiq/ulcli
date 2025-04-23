@@ -108,8 +108,6 @@ def drive_rm(args: List[str]) -> bool:
     entries = parse_pattern(context, pattern)
 
     # parse start & end args
-    logger.info(f"Timestamps: {parsed.start}, {parsed.end}")
-    logger.info(f"Timestamps types: {type(parsed.start)}, {type(parsed.end)}")
     earliest = parse_timestamp_arg(parsed.start)
     latest = parse_timestamp_arg(parsed.end)
     if earliest is not None and latest is not None and earliest > latest:
