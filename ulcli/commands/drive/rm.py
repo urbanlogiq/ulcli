@@ -70,7 +70,7 @@ def drive_rm(args: List[str]) -> bool:
         epilog=epilog,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("-r", help="recursively remove all subdirectories")
+    parser.add_argument("-r", help="recursively remove all subdirectories", action="store_true")
     parser.add_argument(
         "files",
         nargs="+",
@@ -81,11 +81,15 @@ def drive_rm(args: List[str]) -> bool:
     context = get_api_context(parsed)
     files = parsed.files
     logger.info(f"Parsed files: {files}")
+
+    if len(files) != 1:
+        raise ValueError("Only one file/directory pattern is allowed; you supplied more than one.")
     entries = parse_pattern(context, files[0])
 
     # non‑empty directory & recursive
     # -> delete all content (files/sudirs)
     if parsed.r:
+        logger.info("recursive=true")
         for entry in entries:
             do_rm_r(context, entry)
         return True
@@ -95,7 +99,7 @@ def drive_rm(args: List[str]) -> bool:
     for entry in entries:
         if entry.isdir():
             logger.warning(
-                f"Skipping deletion of {entry.name()} because it is a directory. Use -r, if you intend to recursively delete directory contents."
+                f"Skipping deletion of '{entry.name()}' because it is a directory. Use -r, if you intend to recursively delete directory contents."
             )
             continue
         logger.info(f"Deleting {entry.name()}")
