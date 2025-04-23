@@ -1,20 +1,21 @@
 # Copyright (c), CommunityLogiq Software
 import urllib.parse
+import ulcli.argparser
 
 from typing import List
 from loguru import logger
 from ulsdk.api.drive import ls
-from flatbuffer import ulcli
 from ulcli.commands.common import get_api_context
-from .utils import is_directory_entry_id, get_dir_list_slot, DriveEntry
 from ulsdk.request_context import RequestContext
 
+from .utils import is_directory_entry_id
+from .cp import get_dir_list_slot, DriveEntry
 
 
 def do_rm_r(context: RequestContext, source: DriveEntry) -> bool:
     src_entries = source.collect()
     for src in src_entries:
-        if src.isdir():
+        if src.isdir(): 
             do_rm_r(context, src)
         else:
             logger.info(f"Deleting {src.name()}")
