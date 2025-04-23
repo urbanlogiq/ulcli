@@ -106,6 +106,7 @@ def drive_rm(args: List[str]) -> bool:
 
     # list all files matching pattern
     entries = parse_pattern(context, pattern)
+    logger.info(f"Found {len(entries)} entries matching pattern '{pattern}'")
 
     # parse start & end args
     earliest = parse_timestamp_arg(parsed.start)
@@ -116,9 +117,9 @@ def drive_rm(args: List[str]) -> bool:
     # non‑empty directory & recursive
     # -> delete all content (files/sudirs)
     if parsed.r:
+        if earliest is not None or latest is not None:
+            raise Exception("start and end timestamps are not supported with recursive delete")
         for entry in entries:
-            if not timestamp_in_range(entry.time(), earliest, latest):
-                continue
             do_rm_r(context, entry)
         return True
 
