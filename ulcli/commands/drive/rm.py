@@ -106,19 +106,20 @@ def drive_rm(args: List[str]) -> bool:
 
     # list all files matching pattern
     entries = parse_pattern(context, pattern)
-    logger.info(f"Found {len(entries)} entries matching pattern '{pattern}'")
+    if len(entries) == 0:
+        raise ValueError(f"Invalid path: found 0 entries matching pattern {pattern}")
 
     # parse start & end args
     earliest = parse_timestamp_arg(parsed.start)
     latest = parse_timestamp_arg(parsed.end)
     if earliest is not None and latest is not None and earliest > latest:
-        raise Exception("Earliest timestamp must be less than latest timestamp")
+        raise ValueError("Earliest timestamp must be less than latest timestamp")
 
     # non‑empty directory & recursive
     # -> delete all content (files/sudirs)
     if parsed.r:
         if earliest is not None or latest is not None:
-            raise Exception("start and end timestamps are not supported with recursive delete")
+            raise Exception("-start and -end flags are not supported with recursive delete")
         for entry in entries:
             do_rm_r(context, entry)
         return True
