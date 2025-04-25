@@ -317,13 +317,13 @@ to be a directory.
     parser.add_argument("-r", help="recursively copy directories", action="store_true")
     parser.add_argument(
         "-start",
-        help="Earliest last modified date of files to move. Format: unix millisecond or YYYY-MM-DD string (midnight local time)",
+        help="Earliest last modified date of files to move. Format: unix second or YYYY-MM-DD string (midnight local time)",
         type=str,
         default=None,
     )
     parser.add_argument(
         "-end",
-        help="Latest last modified date of files to move. Format: unix millisecond or YYYY-MM-DD string (midnight local time)",
+        help="Latest last modified date of files to move. Format: unix second or YYYY-MM-DD string (midnight local time)",
         type=str,
         default=None,
     )

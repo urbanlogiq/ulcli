@@ -15,8 +15,8 @@ def parse_timestamp_arg(arg: Any) -> int | None:
         return None
     if isinstance(arg, str) and re.match(r"\d{4}-\d{2}-\d{2}", arg):
         return int(datetime.datetime.strptime(arg, "%Y-%m-%d").timestamp())
-    if isinstance(arg, int):
-        return arg
+    if isinstance(arg, int) or (isinstance(arg, str) and arg.isdigit()):
+        return int(arg)
     raise ValueError(
         f"Invalid timestamp: {arg}. Must be a number (unix seconds) or a string in YYYY-MM-DD format"
     )
