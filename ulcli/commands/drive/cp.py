@@ -29,9 +29,10 @@ from ulsdk.api.drive import (
     create_entry,
     post_file,
     put_file_chunk,
+    unlink,
 )
 
-from .utils import parse_timestamp_arg, timestamp_in_range
+from .utils import parse_timestamp_arg, timestamp_in_range, is_directory_entry_id
 
 
 CHUNK_SIZE = 96 * 1024 * 1024
@@ -103,7 +104,13 @@ def mk_dir(context: RequestContext, parent: uuid.UUID, dir: str) -> ObjectId:
     return summary.id
 
 
-class DriveEntry(Entry):
+class Removable(ABC):
+    @abstractmethod
+    def rm(self):
+        """Remove the entry from the drive"""
+
+
+class DriveEntry(Entry, Removable):
     _oid: uuid.UUID
 
     def __init__(self, context: RequestContext, slot: ListSlot):
@@ -165,6 +172,9 @@ class DriveEntry(Entry):
                 return entry
 
         raise Exception("Created directory was not in directory listing")
+
+    def rm(self):
+        unlink(self._context, ObjectId.from_uuid(self._oid))
 
 
 class LocalEntry(Entry):
@@ -315,13 +325,13 @@ to be a directory.
     parser.add_argument("-r", help="recursively copy directories", action="store_true")
     parser.add_argument(
         "-start",
-        help="Earliest last modified date of files to move. Format: unix millisecond or YYYY-MM-DD string (midnight local time)",
+        help="Earliest last modified date of files to move. Format: unix second or YYYY-MM-DD string (midnight local time)",
         type=str,
         default=None,
     )
     parser.add_argument(
         "-end",
-        help="Latest last modified date of files to move. Format: unix millisecond or YYYY-MM-DD string (midnight local time)",
+        help="Latest last modified date of files to move. Format: unix second or YYYY-MM-DD string (midnight local time)",
         type=str,
         default=None,
     )
