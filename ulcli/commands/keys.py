@@ -16,6 +16,7 @@ import ulcli.cmdparser
 from ulcli.commands.common import get_api_context
 from ulcli.commands import UlcliCommand
 from ulcli.internal.console import Console
+from ulsdk.keys import Region
 from ulsdk.api_key_context import ApiKeyContext
 from ulsdk.request_context import RequestContext, File
 
@@ -52,20 +53,20 @@ class BearerTokenContext(RequestContext):
     def __init__(
         self,
         env: Optional[str],
-        region: str,
+        region: Region,
         token: str,
         user_id: str,
     ):
         self._region = region
         self._env = env
-        self._user_id = user_id
+        self._user_id = uuid.UUID(user_id)
         self._token = token
         self._api = None
 
     def user_id(self):
         return self._user_id
 
-    def region(self):
+    def region(self) -> Region:
         return self._region
 
     def _build_api_string(self, path: str) -> Tuple[str, str]:
@@ -79,7 +80,7 @@ class BearerTokenContext(RequestContext):
 
         if self._api is None:
             server = "api" if self._env == "prod" else "stage"
-            api = "https://" + server + ".urbanlogiq." + self._region
+            api = "https://" + server + ".urbanlogiq." + self._region.str()
             return (api + api_path, api_path)
 
         return (self._api + api_path, api_path)
@@ -107,7 +108,7 @@ class BearerTokenContext(RequestContext):
         self,
         path: str,
         params: Optional[Dict] = None,
-        headers: Dict[str, str] = dict(),
+        headers: Optional[Dict[str, str]] = None,
         **kwargs,
     ) -> bytes:
         headers = self._get_headers(bearer_token=self._token)
@@ -122,7 +123,7 @@ class BearerTokenContext(RequestContext):
         body: Union[bytes, str, None] = None,
         mimetype: str = "application/octet-stream",
         params: Optional[Dict] = None,
-        headers: Dict[str, str] = dict(),
+        headers: Optional[Dict[str, str]] = None,
         **kwargs,
     ) -> bytes:
         headers = self._get_headers(
@@ -139,7 +140,7 @@ class BearerTokenContext(RequestContext):
         body: Union[bytes, str, None] = None,
         mimetype: str = "application/octet-stream",
         params: Optional[Dict] = None,
-        headers: Dict[str, str] = dict(),
+        headers: Optional[Dict[str, str]] = None,
         **kwargs,
     ) -> bytes:
         mimetype = (
@@ -164,7 +165,7 @@ class BearerTokenContext(RequestContext):
         self,
         path: str,
         params: Optional[Dict] = None,
-        headers: Dict[str, str] = dict(),
+        headers: Optional[Dict[str, str]] = None,
         **kwargs,
     ) -> bytes:
         raise Exception("not implemented")
@@ -198,10 +199,10 @@ b2c_regions = {
 
 
 def get_bearer_token(
-    username: str, password: str, region: str
+    username: str, password: str, region: Region
 ) -> Union[Tuple[str, str], None]:
-    client_id = client_ids[region]
-    b2c_region = b2c_regions[region]
+    client_id = client_ids[region.str()]
+    b2c_region = b2c_regions[region.str()]
 
     params = {
         "p": "B2C_1_ropc",
@@ -301,7 +302,7 @@ def remove_key(args: List[str]) -> bool:
 
 
 def create_new_key(
-    context: RequestContext, profile: str, id: str, region: str
+    context: RequestContext, profile: str, id: str, region: Region
 ) -> Optional[str]:
     from ulsdk.keys import _load_keys
 
@@ -322,7 +323,7 @@ def create_new_key(
     config = _load_keys()
     config[profile] = {}
     config[profile]["user_id"] = id
-    config[profile]["region"] = region
+    config[profile]["region"] = region.str()
     config[profile]["access_key"] = access_key
     config[profile]["secret_key"] = secret_key
     save_keys(config)
@@ -368,7 +369,7 @@ def create_key(args: List[str]) -> bool:
 
     context = get_api_context(parsed)
     access_key = create_new_key(
-        context, parsed.newprofile, str(context._key.user_id), parsed.region
+        context, parsed.newprofile, str(context._key.user_id), Region.parse(parsed.region)
     )
 
     if access_key is not None:
@@ -381,7 +382,7 @@ def create_key(args: List[str]) -> bool:
     return access_key is not None
 
 
-def do_install(region: str) -> bool:
+def do_install(region: Region) -> bool:
     Console.log(f'Running user install for region "{region}"')
     username = input(f"Enter your urbanlogiq username (aka your email) for {region}: ")
     password = getpass(f"Enter your urbanlogiq password for {region}: ")
@@ -393,11 +394,11 @@ def do_install(region: str) -> bool:
     user_id, token = bearer_token
     env = "prod"
     context = BearerTokenContext(env, region, token, user_id)
-    succeeded = create_new_key(context, region, user_id, region)
+    succeeded = create_new_key(context, region.str(), user_id, region)
 
     if succeeded:
         print(f"Validating {region}... ", end="")
-        test_result = test_profile(region)
+        test_result = test_profile(region.str())
         if test_result:
             Console.log("success!")
         else:
@@ -420,7 +421,8 @@ def install_keys(args: List[str]) -> bool:
 
     regions = sorted(list(need_regions))
     for region in regions:
-        while not do_install(region):
+        parsed_region = Region.parse(region)
+        while not do_install(parsed_region):
             pass
 
     Console.log("Good to go!")

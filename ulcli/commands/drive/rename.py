@@ -40,7 +40,7 @@ def drive_rename(args: List[str]):
     logger.info(
         f"Renaming {parsed.id} to {parsed.name} with overwrite={parsed.overwrite}"
     )
-    id = ObjectId([b for b in uuid.UUID(parsed.id).bytes])
+    id = ObjectId.from_uuid(parsed.id)
     move_request = MoveRequest(parsed.Name, None, id, parsed.overwrite)
     move(context, move_request)
     return True

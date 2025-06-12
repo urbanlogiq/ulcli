@@ -67,13 +67,13 @@ class Entry(ABC):
         """Make a directory in the current directory"""
 
 
-def put_chunk(context: RequestContext, id: str, chunk: bytes):
+def put_chunk(context: RequestContext, id: uuid.UUID, chunk: bytes):
     for i in range(10):
         h = hashlib.sha256()
         h.update(chunk)
         hash = h.hexdigest()
         try:
-            put_file_chunk(context, id, i, hash, chunk)
+            put_file_chunk(context, ObjectId.from_uuid(id), i, hash, chunk)
         except HTTPError as e:
             if e.response.status_code == 514:
                 time.sleep(1)
@@ -89,8 +89,9 @@ def put_file(context: RequestContext, parent: uuid.UUID, content: bytes, filenam
     content_len = len(content)
     num_chunks = math.ceil(content_len / CHUNK_SIZE)
     mime = magic.from_buffer(content, mime=True)
-    summary = create_entry(context, str(parent), filename, "file", mime, num_chunks)
-    id = str(uuid_from_id(summary.id))
+    summary = create_entry(context, ObjectId.from_uuid(parent), filename, "file", mime, num_chunks)
+    id = uuid_from_id(summary.id)
+    assert id
 
     for i in range(num_chunks):
         chunk = content[i * CHUNK_SIZE : (i + 1) * CHUNK_SIZE]
@@ -98,7 +99,7 @@ def put_file(context: RequestContext, parent: uuid.UUID, content: bytes, filenam
 
 
 def mk_dir(context: RequestContext, parent: uuid.UUID, dir: str) -> ObjectId:
-    summary = create_entry(context, str(parent), dir, "directory", "", 0)
+    summary = create_entry(context, ObjectId.from_uuid(parent), dir, "directory", "", 0)
     return summary.id
 
 
@@ -113,7 +114,7 @@ class DriveEntry(Entry):
         self._oid = oid
 
     def parent(self) -> uuid.UUID:
-        obj_res = get_object(self._context, self._oid)
+        obj_res = get_object(self._context, ObjectId.from_uuid(self._oid))
         obj_bytes = bytes(obj_res.obj)
         entry = DirectoryEntry.from_bytes(obj_bytes)
         id = uuid_from_id(entry.parent)
@@ -121,7 +122,7 @@ class DriveEntry(Entry):
         return id
 
     def get(self):
-        return get_file(self._context, str(self._oid))
+        return get_file(self._context, ObjectId.from_uuid(self._oid))
 
     def name(self):
         return self._slot.name
@@ -206,9 +207,8 @@ def is_directory_entry_id(id: str) -> bool:
     return id.startswith("0500")
 
 
-def get_dir_list_slot(context: RequestContext, id_str: str) -> DriveEntry:
-    id = uuid.UUID(id_str)
-    obj_res = get_object(context, id)
+def get_dir_list_slot(context: RequestContext, id: str) -> DriveEntry:
+    obj_res = get_object(context, ObjectId.from_uuid(id))
     obj_bytes = bytes(obj_res.obj)
     entry = DirectoryEntry.from_bytes(obj_bytes)
     parent = uuid_from_id(entry.parent)

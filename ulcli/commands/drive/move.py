@@ -22,7 +22,7 @@ def do_move(
     earliest_timestamp: int | None = None,
     latest_timestamp: int | None = None,
 ) -> None:
-    target_id = ObjectId([b for b in uuid.UUID(target).bytes])
+    target_id = ObjectId.from_uuid(target)
 
     # Source is a single file or single directory, provided as an id
     if is_uuid(source):
@@ -32,7 +32,7 @@ def do_move(
             )
 
         logger.info(f"Moving {source} to {target} with overwrite={overwrite}")
-        source_id = ObjectId([b for b in uuid.UUID(source).bytes])
+        source_id = ObjectId.from_uuid(source)
 
         move_request = MoveRequest(
             None,

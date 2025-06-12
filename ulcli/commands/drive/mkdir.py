@@ -6,6 +6,7 @@ from loguru import logger
 
 import ulcli.argparser
 from ulsdk.api.drive import create_entry
+from ulsdk.types.id import ObjectId
 from ulcli.commands.common import get_api_context
 
 
@@ -23,8 +24,8 @@ def drive_mkdir(args: List[str]):
     parent = parsed.parent
     name = parsed.name
 
-    assert UUID(parent)
-    summary = create_entry(context, str(parent), name, "directory", "", 0)
+    parent_id = ObjectId.from_uuid(parent)
+    summary = create_entry(context, parent_id, name, "directory", "", 0)
     dir_id = summary.id
 
     logger.info(f'Created "{name}" folder with id: {dir_id} in parent: {parent}')
