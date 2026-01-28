@@ -13,20 +13,23 @@ from ulsdk.types.id import (
 from typing import Union, Optional
 from ulsdk.keys import Environment, load_key
 from ulsdk.api_key_context import ApiKeyContext
+from pyv2.auth import LocalContext
 import uuid
 import os
+
+
+def get_local_context(key, profile: str) -> LocalContext:
+    # Use fixed test user/group IDs for local development
+    # These match the headers expected by the local ulv2 instance
+    user = os.getenv("UL_LOCAL_USER", "00000000-0000-0000-0000-000000000001")
+    groups = os.getenv("UL_LOCAL_GROUPS", "00000000-0000-0000-0000-000000000002")
+
+    return LocalContext(user, groups, None, str(uuid.uuid4()))
 
 
 def get_api_context(parsed):
     # prioritize passed env then env variable and then by default prod
     env_str = parsed.env or os.getenv("UL_ENV") or "prod"
-    match env_str:
-        case "prod":
-            env = Environment.Prod
-        case "stage":
-            env = Environment.Stage
-        case _:
-            raise Exception(f"Invalid env: {env_str}")
 
     # prioritize passed profile, then region and then env variable
     profile_arg = parsed.profile if hasattr(parsed, "profile") else None
@@ -41,6 +44,17 @@ def get_api_context(parsed):
         raise Exception(
             "Unable to find API keys. Please run `ul keys install` to setup your API keys"
         )
+
+    if env_str == "local":
+        return get_local_context(key, profile)
+
+    match env_str:
+        case "prod":
+            env = Environment.Prod
+        case "stage":
+            env = Environment.Stage
+        case _:
+            raise Exception(f"Invalid env: {env_str}")
 
     return ApiKeyContext(key, env)
 
