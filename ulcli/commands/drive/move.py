@@ -64,7 +64,7 @@ def do_move(
             continue
 
         if not timestamp_in_range(
-            item.time,
+            item.time / 1000, # convert timestamp to seconds
             earliest_timestamp,
             latest_timestamp,
         ):
