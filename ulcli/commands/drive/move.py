@@ -70,7 +70,12 @@ def do_move(
         ):
             continue
 
-        logger.info(f"Moving {item.name} ({id}) to {target} with overwrite={overwrite}")
+        if obj_id == target_id:
+            breakpoint()
+            logger.info(f"Not moving {item.name} ({obj_id}) to {target} as it is the target directory")
+            continue
+
+        logger.info(f"Moving {item.name} to {target} with overwrite={overwrite}")
 
         move_request = MoveRequest(
             None,
