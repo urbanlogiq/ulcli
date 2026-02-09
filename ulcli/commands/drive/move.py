@@ -69,7 +69,7 @@ def do_move(
             latest_timestamp,
         ):
             continue
-
+        # ensure that we don't move the target directory to itself
         if obj_id == target_id:
             breakpoint()
             logger.info(f"Not moving {item.name} ({obj_id}) to {target} as it is the target directory")
