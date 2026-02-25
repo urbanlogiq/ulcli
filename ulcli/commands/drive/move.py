@@ -64,13 +64,17 @@ def do_move(
             continue
 
         if not timestamp_in_range(
-            item.time,
+            item.time / 1000, # convert timestamp to seconds
             earliest_timestamp,
             latest_timestamp,
         ):
             continue
+        # ensure that we don't move the target directory to itself
+        if obj_id == target_id:
+            logger.info(f"Not moving {item.name} ({obj_id}) to {target} as it is the target directory")
+            continue
 
-        logger.info(f"Moving {item.name} ({id}) to {target} with overwrite={overwrite}")
+        logger.info(f"Moving {item.name} to {target} with overwrite={overwrite}")
 
         move_request = MoveRequest(
             None,
