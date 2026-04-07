@@ -170,6 +170,14 @@ class BearerTokenContext(RequestContext):
     ) -> bytes:
         raise Exception("not implemented")
 
+    def connect(
+        self,
+        path: str,
+        params: Optional[Dict] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ):
+        raise NotImplementedError("BearerTokenContext does not support websocket connections")
+
 
 def test_profile(profile: str) -> bool:
     from ulsdk.keys import load_key, Environment
