@@ -27,7 +27,7 @@ def drive_root(args: List[str]):
         "id",
         help="user or group UUID",
     )
-    parsed = parser.parse_args(sys.argv[2:])
+    parsed = parser.parse_args(args)
     context = get_api_context(parsed)
 
     root = get_root_id(context, parsed.id)
