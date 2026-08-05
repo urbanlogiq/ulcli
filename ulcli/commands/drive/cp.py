@@ -10,7 +10,7 @@ import math
 import time
 import magic
 from abc import ABC, abstractmethod
-from typing import List, Self
+from typing import List, NamedTuple, Self, Sequence
 from requests import HTTPError
 from flatbuffers import util
 from loguru import logger
@@ -204,8 +204,11 @@ class LocalEntry(Entry):
         return [LocalEntry(x) for x in glob.glob(os.path.join(self._path, "*"))]
 
     def mkdir(self, dir: str) -> "LocalEntry":
+        # DriveEntry.mkdir accepts a directory that already exists, so the local
+        # entry must accept one too. A recursive copy into an existing tree
+        # depends on it.
         path = os.path.join(self._path, dir)
-        os.mkdir(path)
+        os.makedirs(path, exist_ok=True)
         return LocalEntry(path)
 
 
@@ -234,8 +237,21 @@ def get_dir_list_slot(context: RequestContext, id: str) -> DriveEntry:
     raise ValueError(f"Could not find directory with id {id} in parent {parent}")
 
 
-def parse_files(context: RequestContext, files: List[str]) -> List[Entry]:
-    resolved_files = []
+class ResolvedArg(NamedTuple):
+    """The entries that one command line path argument resolved to.
+
+    `wildcard` records whether the argument was a wildcard pattern. A pattern
+    resolves to the matched entries themselves, while a plain path resolves to
+    the single entry that the path names. Recursive copies need to tell the two
+    apart, because `<dir>` names the directory and `<dir>/*` names its children.
+    """
+
+    entries: Sequence[Entry]
+    wildcard: bool
+
+
+def parse_files(context: RequestContext, files: List[str]) -> List[ResolvedArg]:
+    resolved_args = []
     nfiles = len(files)
     for i in range(nfiles):
         file = files[i]
@@ -255,7 +271,8 @@ def parse_files(context: RequestContext, files: List[str]) -> List[Entry]:
                     "to reference drive roots use the syntax <guid>:/<path>"
                 )
 
-            resolved_files.append(get_dir_list_slot(context, splits[0]))
+            entry = get_dir_list_slot(context, splits[0])
+            resolved_args.append(ResolvedArg([entry], False))
             continue
 
         # Dirve location may also be a directory id followed by a relative path, e.g.:
@@ -265,22 +282,39 @@ def parse_files(context: RequestContext, files: List[str]) -> List[Entry]:
             root = splits[0][:-1]
             path = "/".join(splits[1:])
 
+            # The drive treats a trailing slash the same way as a trailing `*`,
+            # so both forms list the contents of the directory.
+            wildcard = path.endswith("*") or path.endswith("/")
+
             entries = ls(context, root, path)
             slots = entries.slots
             if len(slots) == 0 and i == nfiles - 1:
                 raise Exception("destination path does not exist; make it")
 
-            resolved_files += [DriveEntry(context, entry) for entry in slots]
+            if len(slots) == 0:
+                logger.warning(f"Source {files[i]} matched nothing")
+
+            resolved_args.append(
+                ResolvedArg([DriveEntry(context, entry) for entry in slots], wildcard)
+            )
         else:
-            # local path
+            # local path. Unlike the drive, a local trailing slash still names
+            # the directory itself, so only a `*` expands.
+            wildcard = "*" in file
+
             globs = glob.glob(file)
             if len(globs) == 0 and i == nfiles - 1:
                 os.mkdir(file)
                 globs = [file]
 
-            resolved_files += [LocalEntry(file) for file in globs]
+            if len(globs) == 0:
+                logger.warning(f"Source {files[i]} matched nothing")
 
-    return resolved_files
+            resolved_args.append(
+                ResolvedArg([LocalEntry(path) for path in globs], wildcard)
+            )
+
+    return resolved_args
 
 
 def do_cp_r(context: RequestContext, source: Entry, dest: Entry) -> bool:
@@ -314,6 +348,12 @@ the drive to another.
 To play nicely with shell wildcard expansion, all paths containing wildcards
 need to be quoted. If a wildcard is used, the destination (last location) needs
 to be a directory.
+
+With -r, the two source forms copy different things:
+
+    <guid>:/folder      copies the contents of `folder` into the destination
+    <guid>:/folder/*    copies each entry in `folder` into the destination,
+                        and each matched directory keeps its own name
 """
 
     parser = ulcli.argparser.ArgumentParser(
@@ -346,9 +386,17 @@ to be a directory.
     if len(files) < 2:
         raise Exception("Need at least two files (source and destination)")
 
-    parsed_files = parse_files(context, files)
-    sources = parsed_files[:-1]
-    dest = parsed_files[-1]
+    parsed_args = parse_files(context, files)
+    source_args = parsed_args[:-1]
+    dest_arg = parsed_args[-1]
+
+    if len(dest_arg.entries) != 1:
+        raise Exception(
+            f"The destination must name a single file or directory, but it matched {len(dest_arg.entries)} entries"
+        )
+
+    dest = dest_arg.entries[0]
+    sources = [entry for arg in source_args for entry in arg.entries]
 
     earliest = parse_timestamp_arg(parsed.start)
     latest = parse_timestamp_arg(parsed.end)
@@ -357,18 +405,34 @@ to be a directory.
         raise Exception("Earliest timestamp must be less than latest timestamp")
 
     if parsed.r:
-        if len(sources) != 1:
+        if len(sources) == 0:
             raise Exception("Expected a source directory and a destination directory")
-
-        source = sources[0]
-
-        if not sources[0].isdir():
-            raise Exception("Source must be a directory")
 
         if not dest.isdir():
             raise Exception("Destination must be a directory")
 
-        return do_cp_r(context, source, dest)
+        for arg in source_args:
+            if not arg.wildcard:
+                # A plain path names one directory, and its contents merge into
+                # the destination.
+                for src in arg.entries:
+                    if not src.isdir():
+                        raise Exception("Source must be a directory")
+
+                    do_cp_r(context, src, dest)
+
+                continue
+
+            # A wildcard names the matched entries, so each one lands in the
+            # destination under its own name.
+            for src in arg.entries:
+                if src.isdir():
+                    do_cp_r(context, src, dest.mkdir(src.name()))
+                else:
+                    logger.info(f"Processing {src.name()}")
+                    dest.put(src.get(), src.name())
+
+        return True
 
     if len(sources) > 1:
         if not dest.isdir():
