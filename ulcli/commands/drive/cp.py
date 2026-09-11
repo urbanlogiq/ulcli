@@ -37,6 +37,9 @@ from .utils import parse_timestamp_arg, timestamp_in_range, is_directory_entry_i
 
 CHUNK_SIZE = 96 * 1024 * 1024
 
+# A root directory has this id as its parent.
+NIL_UUID = uuid.UUID(int=0)
+
 
 class Entry(ABC):
     @abstractmethod
@@ -90,7 +93,9 @@ def put_file(context: RequestContext, parent: uuid.UUID, content: bytes, filenam
     content_len = len(content)
     num_chunks = math.ceil(content_len / CHUNK_SIZE)
     mime = magic.from_buffer(content, mime=True)
-    summary = create_entry(context, ObjectId.from_uuid(parent), filename, "file", mime, num_chunks)
+    summary = create_entry(
+        context, ObjectId.from_uuid(parent), filename, "file", mime, num_chunks
+    )
     id = uuid_from_id(summary.id)
     assert id
 
@@ -102,6 +107,18 @@ def put_file(context: RequestContext, parent: uuid.UUID, content: bytes, filenam
 def mk_dir(context: RequestContext, parent: uuid.UUID, dir: str) -> ObjectId:
     summary = create_entry(context, ObjectId.from_uuid(parent), dir, "directory", "", 0)
     return summary.id
+
+
+def get_parent_id(context: RequestContext, id: uuid.UUID) -> uuid.UUID:
+    """Return the id of the directory that holds the entry `id`.
+
+    The parent of a root directory is `NIL_UUID`.
+    """
+    obj_res = get_object(context, ObjectId.from_uuid(id))
+    entry = DirectoryEntry.from_bytes(bytes(obj_res.obj))
+    parent = uuid_from_id(entry.parent)
+    assert parent is not None
+    return parent
 
 
 class Removable(ABC):
@@ -121,12 +138,7 @@ class DriveEntry(Entry, Removable):
         self._oid = oid
 
     def parent(self) -> uuid.UUID:
-        obj_res = get_object(self._context, ObjectId.from_uuid(self._oid))
-        obj_bytes = bytes(obj_res.obj)
-        entry = DirectoryEntry.from_bytes(obj_bytes)
-        id = uuid_from_id(entry.parent)
-        assert id is not None
-        return id
+        return get_parent_id(self._context, self._oid)
 
     def get(self):
         return get_file(self._context, ObjectId.from_uuid(self._oid))
@@ -212,29 +224,30 @@ class LocalEntry(Entry):
         return LocalEntry(path)
 
 
-def is_directory_entry_id(id: str) -> bool:
-    try:
-        assert uuid.UUID(id)
-    except Exception:
-        return False
-    return id.startswith("0500")
-
-
 def get_dir_list_slot(context: RequestContext, id: str) -> DriveEntry:
-    obj_res = get_object(context, ObjectId.from_uuid(id))
-    obj_bytes = bytes(obj_res.obj)
-    entry = DirectoryEntry.from_bytes(obj_bytes)
-    parent = uuid_from_id(entry.parent)
+    """Resolve a bare entry id, of a file or of a directory, to its listing slot.
 
-    if parent == "00000000-0000-0000-0000-000000000000":
+    The drive has no endpoint that returns the listing slot of one entry, and
+    the entry object does not hold the name of the entry. The name, time and
+    size are in the listing of the parent directory. So this reads the parent
+    id from the entry object, lists the parent, and returns the slot that has
+    the id. A root directory has `NIL_UUID` as its parent and is found in the
+    list of drive roots instead.
+    """
+    entry_id = uuid.UUID(id)
+    parent = get_parent_id(context, entry_id)
+
+    if parent == NIL_UUID:
         children = get_roots(context)
     else:
         children = ls(context, str(parent), "*")
 
     for child in children.slots:
-        if uuid_from_id(child.id) == id:
+        if uuid_from_id(child.id) == entry_id:
             return DriveEntry(context, child)
-    raise ValueError(f"Could not find directory with id {id} in parent {parent}")
+    raise ValueError(
+        f"Could not find entry {id} in the listing of its parent directory {parent}"
+    )
 
 
 class ResolvedArg(NamedTuple):
@@ -263,8 +276,10 @@ def parse_files(context: RequestContext, files: List[str]) -> List[ResolvedArg]:
 
         splits = file.split("/")
 
-        # Drive location may be a directory id, e.g.
-        # 05006c77-e69f-893e-40d1-842b64c961a5
+        # Drive location may be the bare id of one entry, a file or a
+        # directory, e.g. 05006c77-e69f-893e-40d1-842b64c961a5
+        # The parent of the entry is read from the drive, so the caller does
+        # not have to name it.
         if is_directory_entry_id(splits[0]):
             if len(splits) > 1:
                 raise Exception(
@@ -335,15 +350,18 @@ def do_cp_r(context: RequestContext, source: Entry, dest: Entry) -> bool:
 def drive_cp(args: List[str]) -> bool:
     description = "Copy files to and from the drive."
 
-    epilog = """Example:
+    epilog = """Examples:
 
     ul drive cp -profile us '05006c77-e69f-893e-40d1-842b64c961a5:/Dataset upload folder/Transportation/Turning movement counts/*' ./tmp
+    ul drive cp -profile us 0500addd-0f04-fe98-4ff2-bdef69cb097d ./tmp
 
 Drive locations are specified by the prefix `<uuid>:`, where the uuid is the id
-of a root directory entry. All other paths are assumed to be local. This bit of
-functionality will copy files (either one at a time or in bulk) from the drive
-to a local location, from a local location to the drive, or from one location in
-the drive to another.
+of a root directory entry, or by the bare id of one file or directory. A bare id
+needs no parent directory: the command reads the parent from the drive. Use it
+to download one file when you know only its id. All other paths are assumed to
+be local. This bit of functionality will copy files (either one at a time or in
+bulk) from the drive to a local location, from a local location to the drive,
+or from one location in the drive to another.
 
 To play nicely with shell wildcard expansion, all paths containing wildcards
 need to be quoted. If a wildcard is used, the destination (last location) needs
