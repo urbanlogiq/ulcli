@@ -1,18 +1,34 @@
 # Copyright (c), CommunityLogiq Software
 
-"""Tests for the recursive path of `ul drive cp`.
+"""Tests for `ul drive cp`.
 
-The tests replace `parse_files` with prepared results and copy between in-memory
-trees, so they never touch the network or the filesystem.
+The copy tests replace `parse_files` with prepared results and copy between
+in-memory trees. The bare-id tests replace the SDK calls that `cp` makes. So no
+test touches the network, and only the download test writes to the filesystem
+(under `tmp_path`).
 """
 
-from typing import Dict, List, Optional, cast
+import uuid
+from pathlib import Path
+from typing import Dict, List, NoReturn, Optional, cast
 
 import pytest
 
+from ulcli.commands.common import uuid_from_id
 from ulcli.commands.drive import cp
 from ulcli.commands.drive.cp import ResolvedArg
 from ulsdk.request_context import RequestContext
+from ulsdk.types.fs import (
+    DirectoryEntry,
+    DirectoryList,
+    Entry,
+    ListEntry,
+    ListFile,
+    ListSlot,
+    TopLevelDirectory,
+)
+from ulsdk.types.id import ObjectId
+from ulsdk.types.object import DataCatalogObject
 
 
 class FakeEntry(cp.Entry):
@@ -328,3 +344,141 @@ def test_non_recursive_copy_skips_directories(monkeypatch: pytest.MonkeyPatch):
 
     assert run_cp(monkeypatch, ["folder/*", "dest"], resolved)
     assert flatten(dest) == {"top.csv": b"top"}
+
+
+# Bare entry ids
+#
+# `ul drive cp <id> <dest>` names one file or directory by its id alone. The
+# parent is read from the drive, so these tests build the entry object and the
+# parent listing that the SDK calls return.
+
+PARENT_ID = uuid.UUID("05005b63-7183-a068-417b-b73392b83856")
+FILE_ID = uuid.UUID("0500addd-0f04-fe98-4ff2-bdef69cb097d")
+OTHER_ID = uuid.UUID("0500e62f-9ac7-6323-85d6-0ca330b10480")
+
+
+def entry_object(parent: uuid.UUID) -> DataCatalogObject:
+    """The data catalog object of a drive entry whose parent is `parent`."""
+
+    obj = DataCatalogObject.make_default()
+    entry = DirectoryEntry(Entry.make_default(), ObjectId.from_uuid(parent))
+    obj.obj = entry.to_bytes()
+    return obj
+
+
+def file_slot(id: uuid.UUID, name: str, time_ms: int = 0) -> ListSlot:
+    """A listing slot for a file, as `ls` returns it."""
+
+    entry = ListEntry(ListFile("text/csv", 3, None))
+    return ListSlot(None, entry, ObjectId.from_uuid(id), None, name, 3, time_ms, 0)
+
+
+def root_slot(id: uuid.UUID, name: str) -> ListSlot:
+    """A listing slot for a drive root, as `get_roots` returns it."""
+
+    entry = ListEntry(TopLevelDirectory.make_default())
+    return ListSlot(None, entry, ObjectId.from_uuid(id), None, name, 0, 0, 0)
+
+
+def unexpected_call(*args: object) -> NoReturn:
+    raise AssertionError(f"unexpected SDK call with {args}")
+
+
+def test_bare_file_id_resolves_through_the_parent_listing(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A file id resolves to its own slot, and only the parent is listed."""
+
+    listed = []
+
+    def fake_ls(context: RequestContext, root: str, tail: str) -> DirectoryList:
+        listed.append((root, tail))
+        return DirectoryList(
+            [file_slot(OTHER_ID, "other.csv"), file_slot(FILE_ID, "a.csv", 1500)]
+        )
+
+    monkeypatch.setattr(cp, "get_object", lambda context, id: entry_object(PARENT_ID))
+    monkeypatch.setattr(cp, "ls", fake_ls)
+    monkeypatch.setattr(cp, "get_roots", unexpected_call)
+
+    entry = cp.get_dir_list_slot(cast(RequestContext, None), str(FILE_ID))
+
+    assert listed == [(str(PARENT_ID), "*")]
+    assert entry.name() == "a.csv"
+    assert not entry.isdir()
+    assert entry.time() == 1.5
+    assert entry._oid == FILE_ID
+
+
+def test_bare_root_id_resolves_through_the_drive_roots(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A root has the nil id as its parent, so it is found among the roots."""
+
+    monkeypatch.setattr(cp, "get_object", lambda context, id: entry_object(cp.NIL_UUID))
+    monkeypatch.setattr(cp, "ls", unexpected_call)
+    monkeypatch.setattr(
+        cp,
+        "get_roots",
+        lambda context: DirectoryList([root_slot(PARENT_ID, "Group drive")]),
+    )
+
+    entry = cp.get_dir_list_slot(cast(RequestContext, None), str(PARENT_ID))
+
+    assert entry.name() == "Group drive"
+    assert entry.isdir()
+
+
+def test_bare_id_missing_from_the_parent_listing_is_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(cp, "get_object", lambda context, id: entry_object(PARENT_ID))
+    monkeypatch.setattr(
+        cp,
+        "ls",
+        lambda context, root, tail: DirectoryList([file_slot(OTHER_ID, "other.csv")]),
+    )
+
+    with pytest.raises(ValueError, match="Could not find entry"):
+        cp.get_dir_list_slot(cast(RequestContext, None), str(FILE_ID))
+
+
+def test_parse_files_resolves_a_bare_id_as_one_plain_entry(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    resolved = FakeEntry("a.csv", False, b"a")
+    monkeypatch.setattr(cp, "get_dir_list_slot", lambda context, id: resolved)
+    monkeypatch.setattr(cp.glob, "glob", lambda pattern: [pattern])
+    monkeypatch.setattr(cp, "LocalEntry", lambda path: FakeEntry(path, True))
+
+    args = cp.parse_files(cast(RequestContext, None), [str(FILE_ID), "dest"])
+
+    assert args[0] == ResolvedArg([resolved], False)
+
+
+def test_parse_files_rejects_a_path_under_a_bare_id():
+    with pytest.raises(Exception, match="<guid>:/<path>"):
+        cp.parse_files(cast(RequestContext, None), [f"{FILE_ID}/a.csv", "dest"])
+
+
+def test_copy_by_file_id_downloads_the_file_into_a_local_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """`ul drive cp <file-id> ./dir` downloads the file with no parent named."""
+
+    def fake_get_file(context: RequestContext, id: ObjectId) -> bytes:
+        assert uuid_from_id(id) == FILE_ID
+        return b"abc"
+
+    monkeypatch.setattr(cp, "get_api_context", lambda parsed: None)
+    monkeypatch.setattr(cp, "get_object", lambda context, id: entry_object(PARENT_ID))
+    monkeypatch.setattr(
+        cp,
+        "ls",
+        lambda context, root, tail: DirectoryList([file_slot(FILE_ID, "a.csv")]),
+    )
+    monkeypatch.setattr(cp, "get_file", fake_get_file)
+
+    assert cp.drive_cp([str(FILE_ID), str(tmp_path)])
+
+    assert (tmp_path / "a.csv").read_bytes() == b"abc"
