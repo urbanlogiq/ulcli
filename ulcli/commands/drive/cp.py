@@ -36,6 +36,7 @@ from .utils import parse_timestamp_arg, timestamp_in_range, is_directory_entry_i
 
 
 CHUNK_SIZE = 96 * 1024 * 1024
+CHUNK_UPLOAD_ATTEMPTS = 10
 
 # A root directory has this id as its parent.
 NIL_UUID = uuid.UUID(int=0)
@@ -71,22 +72,22 @@ class Entry(ABC):
         """Make a directory in the current directory"""
 
 
-def put_chunk(context: RequestContext, id: uuid.UUID, chunk: bytes):
-    for i in range(10):
-        h = hashlib.sha256()
-        h.update(chunk)
-        hash = h.hexdigest()
+def put_chunk(context: RequestContext, id: uuid.UUID, index: int, chunk: bytes):
+    """Upload one chunk of a file at its index.
+
+    The drive answers 514 when the hash of the bytes it received differs from
+    the hash that came with them. Only that answer is tried again.
+    """
+    hash = hashlib.sha256(chunk).hexdigest()
+    for attempt in range(CHUNK_UPLOAD_ATTEMPTS):
         try:
-            put_file_chunk(context, ObjectId.from_uuid(id), i, hash, chunk)
+            put_file_chunk(context, ObjectId.from_uuid(id), index, hash, chunk)
+            return
         except HTTPError as e:
-            if e.response.status_code == 514:
-                time.sleep(1)
-                continue
-
-            if e.response.status_code == 204:
-                return
-
-            raise e
+            last_attempt = attempt == CHUNK_UPLOAD_ATTEMPTS - 1
+            if e.response.status_code != 514 or last_attempt:
+                raise
+            time.sleep(1)
 
 
 def put_file(context: RequestContext, parent: uuid.UUID, content: bytes, filename: str):
@@ -101,7 +102,7 @@ def put_file(context: RequestContext, parent: uuid.UUID, content: bytes, filenam
 
     for i in range(num_chunks):
         chunk = content[i * CHUNK_SIZE : (i + 1) * CHUNK_SIZE]
-        put_chunk(context, id, chunk)
+        put_chunk(context, id, i, chunk)
 
 
 def mk_dir(context: RequestContext, parent: uuid.UUID, dir: str) -> ObjectId:

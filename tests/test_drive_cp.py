@@ -8,11 +8,14 @@ test touches the network, and only the download test writes to the filesystem
 (under `tmp_path`).
 """
 
+import hashlib
 import uuid
 from pathlib import Path
-from typing import Dict, List, NoReturn, Optional, cast
+from types import SimpleNamespace
+from typing import Dict, List, NoReturn, Optional, Tuple, cast
 
 import pytest
+from requests import HTTPError, Response
 
 from ulcli.commands.common import uuid_from_id
 from ulcli.commands.drive import cp
@@ -482,3 +485,101 @@ def test_copy_by_file_id_downloads_the_file_into_a_local_directory(
     assert cp.drive_cp([str(FILE_ID), str(tmp_path)])
 
     assert (tmp_path / "a.csv").read_bytes() == b"abc"
+
+
+class FakeResponse:
+    def __init__(self, status_code: int):
+        self.status_code = status_code
+
+
+def http_error(status_code: int) -> HTTPError:
+    return HTTPError(response=cast(Response, FakeResponse(status_code)))
+
+
+@pytest.fixture
+def uploads(monkeypatch: pytest.MonkeyPatch) -> List[Tuple[int, bytes]]:
+    """Record each chunk the drive accepts, as (index, bytes), for a 4-byte chunk size."""
+    accepted: List[Tuple[int, bytes]] = []
+
+    def fake_create_entry(context, parent, name, ty, mime, chunks):
+        return SimpleNamespace(id=ObjectId.from_uuid(FILE_ID))
+
+    def fake_put_file_chunk(context, id, index, hash, chunk):
+        assert uuid_from_id(id) == FILE_ID
+        assert hash == hashlib.sha256(chunk).hexdigest()
+        accepted.append((index, chunk))
+
+    monkeypatch.setattr(cp, "CHUNK_SIZE", 4)
+    monkeypatch.setattr(cp, "create_entry", fake_create_entry)
+    monkeypatch.setattr(cp, "put_file_chunk", fake_put_file_chunk)
+    monkeypatch.setattr(cp.time, "sleep", lambda seconds: None)
+    return accepted
+
+
+def test_put_file_sends_a_one_chunk_file_once_at_index_zero(
+    uploads: List[Tuple[int, bytes]],
+):
+    cp.put_file(cast(RequestContext, None), PARENT_ID, b"abc", "a.csv")
+
+    assert uploads == [(0, b"abc")]
+
+
+def test_put_file_sends_each_chunk_once_at_its_own_index(
+    uploads: List[Tuple[int, bytes]],
+):
+    cp.put_file(cast(RequestContext, None), PARENT_ID, b"abcdefghij", "a.csv")
+
+    assert uploads == [(0, b"abcd"), (1, b"efgh"), (2, b"ij")]
+
+
+def test_put_chunk_tries_again_at_the_same_index_after_a_hash_mismatch(
+    monkeypatch: pytest.MonkeyPatch, uploads: List[Tuple[int, bytes]]
+):
+    answers = [http_error(514), http_error(514), None]
+    indexes: List[int] = []
+
+    def flaky_put_file_chunk(context, id, index, hash, chunk):
+        indexes.append(index)
+        answer = answers.pop(0)
+        if answer is not None:
+            raise answer
+
+    monkeypatch.setattr(cp, "put_file_chunk", flaky_put_file_chunk)
+
+    cp.put_chunk(cast(RequestContext, None), FILE_ID, 3, b"abc")
+
+    assert indexes == [3, 3, 3]
+
+
+def test_put_chunk_raises_any_other_error_at_once(
+    monkeypatch: pytest.MonkeyPatch, uploads: List[Tuple[int, bytes]]
+):
+    calls: List[int] = []
+
+    def failing_put_file_chunk(context, id, index, hash, chunk):
+        calls.append(index)
+        raise http_error(400)
+
+    monkeypatch.setattr(cp, "put_file_chunk", failing_put_file_chunk)
+
+    with pytest.raises(HTTPError):
+        cp.put_chunk(cast(RequestContext, None), FILE_ID, 0, b"abc")
+
+    assert calls == [0]
+
+
+def test_put_chunk_raises_when_the_hash_mismatch_does_not_clear(
+    monkeypatch: pytest.MonkeyPatch, uploads: List[Tuple[int, bytes]]
+):
+    calls: List[int] = []
+
+    def failing_put_file_chunk(context, id, index, hash, chunk):
+        calls.append(index)
+        raise http_error(514)
+
+    monkeypatch.setattr(cp, "put_file_chunk", failing_put_file_chunk)
+
+    with pytest.raises(HTTPError):
+        cp.put_chunk(cast(RequestContext, None), FILE_ID, 0, b"abc")
+
+    assert len(calls) == cp.CHUNK_UPLOAD_ATTEMPTS
