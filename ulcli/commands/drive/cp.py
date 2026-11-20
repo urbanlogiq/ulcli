@@ -16,7 +16,6 @@ import uuid
 import hashlib
 import time
 import magic
-import requests
 from abc import ABC, abstractmethod
 from collections import deque
 from types import FrameType
@@ -40,14 +39,14 @@ import ulcli.argparser
 from ulcli.commands.common import get_api_context
 from ulcli.commands.common import uuid_from_id
 from ulsdk.api.datacatalog import get_object
-from ulsdk.api_key_context import ApiKeyContext, _generate_auth_header
 from ulsdk.types.id import ObjectId
 from ulsdk.types.fs import ListSlot, DirectoryEntry, ListDirectory, TopLevelDirectory
-from ulsdk.request_context import RequestContext, _get_endpoint
+from ulsdk.request_context import RequestContext
 from ulsdk.api.drive import (
     ls,
     get_roots,
     create_entry,
+    get_file_stream,
     put_file_chunk,
     unlink,
 )
@@ -63,7 +62,6 @@ PARTIAL_SUFFIX = ".ulpart"
 PARTIAL_NAME_LENGTH = 48
 INTERRUPT_GRACE_SECONDS = 2.0
 DOWNLOAD_TIMEOUT = (10, 60)
-GET_FILE_PATH = "/v1/api/ulv2/drive/file/:id"
 
 # A root directory has this id as its parent.
 NIL_UUID = uuid.UUID(int=0)
@@ -200,44 +198,20 @@ def put_file(
         chunk = next(chunks, b"")
 
 
-def open_drive_file(context: RequestContext, id: uuid.UUID) -> requests.Response:
-    """Open a drive download without a copy of the complete file in memory.
-
-    The library has no public method for this operation. Reuse its request
-    signing and address lookup functions.
-    """
-    if not isinstance(context, ApiKeyContext):
-        raise TypeError("A drive download needs an API key context")
-
-    path = GET_FILE_PATH.replace(":id", str(id), 1)
-    params: Dict[str, str] = dict()
-    headers = _generate_auth_header(context._key, "GET", path, params, dict(), None)
-    endpoint = _get_endpoint(context.region(), context.env(), path)
-
-    response = requests.get(
-        endpoint,
-        params=params,
-        headers=headers,
-        stream=True,
-        timeout=DOWNLOAD_TIMEOUT,
-        allow_redirects=False,
-    )
-    try:
-        response.raise_for_status()
-        if 300 <= response.status_code < 400:
-            raise HTTPError("The drive redirected the download", response=response)
-    except BaseException:
-        response.close()
-        raise
-    return response
-
-
 def read_drive_file(
     context: RequestContext, id: uuid.UUID, block_size: int
 ) -> Generator[bytes, None, None]:
     """Read a drive file in blocks of at most `block_size` bytes."""
-    with open_drive_file(context, id) as response:
-        yield from response.iter_content(min(block_size, BLOCK_SIZE))
+    if block_size < 1:
+        raise ValueError("Block size must be at least 1")
+    size = min(block_size, BLOCK_SIZE)
+    with get_file_stream(
+        context,
+        ObjectId.from_uuid(id),
+        timeout=DOWNLOAD_TIMEOUT,
+        allow_redirects=False,
+    ) as file:
+        yield from iter(lambda: file.read(size), b"")
 
 
 # Track temporary files for removal after cancellation.

@@ -7,6 +7,7 @@ import base64
 import gzip
 import hashlib
 import http.server
+import io
 import os
 import signal
 import stat
@@ -38,7 +39,6 @@ from requests import HTTPError, Response
 from ulcli.commands.common import uuid_from_id
 from ulcli.commands.drive import cp
 from ulcli.commands.drive.cp import ResolvedArg, Transfer
-from ulsdk.api import drive as sdk_drive
 from ulsdk.api_key_context import ApiKeyContext
 from ulsdk.keys import Environment, Key, Region
 from ulsdk.request_context import RequestContext
@@ -1113,7 +1113,10 @@ class FakeDrive:
 @pytest.fixture
 def drive(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeDrive]:
     fake = FakeDrive()
-    monkeypatch.setattr(cp, "_get_endpoint", lambda region, env, path: fake.url(path))
+    monkeypatch.setattr(
+        "ulsdk.api_key_context._get_endpoint",
+        lambda region, env, path: fake.url(path),
+    )
     yield fake
     fake.close()
 
@@ -1168,40 +1171,40 @@ def test_read_drive_file_sends_the_signed_request_that_the_sdk_sends(drive: Fake
     assert "x-ul-date" in lowered
 
 
-def test_open_drive_file_signs_exactly_as_the_sdk_does(monkeypatch: pytest.MonkeyPatch):
+def test_read_drive_file_sets_a_timeout_and_follows_no_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+):
 
-    sent: List[Tuple[str, Dict[str, object]]] = []
+    sent: List[Dict[str, object]] = []
 
-    def fake_get(url: str, **kwargs: object) -> SimpleNamespace:
-        # Copy the headers before the library changes them.
-        sent.append((url, {**kwargs, "headers": dict(cast(dict, kwargs["headers"]))}))
-        return SimpleNamespace(
-            status_code=200,
-            headers={},
-            content=b"",
-            raise_for_status=lambda: None,
-            close=lambda: None,
-        )
+    def fake_get(url: str, **kwargs: object) -> Response:
+        sent.append(kwargs)
+        response = Response()
+        response.status_code = 200
+        response.raw = io.BytesIO(b"abc")
+        return response
 
     monkeypatch.setattr(requests, "get", fake_get)
-    monkeypatch.setattr(time, "time", lambda: 1_700_000_000)
-    context = api_key_context()
 
-    sdk_drive.get_file(context, ObjectId.from_uuid(FILE_ID))
-    cp.open_drive_file(context, FILE_ID)
+    assert b"".join(cp.read_drive_file(api_key_context(), FILE_ID, 4)) == b"abc"
 
-    (sdk_url, sdk_kwargs), (url, kwargs) = sent
-    assert url == sdk_url
-    assert kwargs.pop("stream") is True
-    assert kwargs.pop("timeout") == cp.DOWNLOAD_TIMEOUT
-    assert kwargs.pop("allow_redirects") is False
-    assert kwargs == sdk_kwargs
-    assert "authorization" in cast(dict, kwargs["headers"])
+    [kwargs] = sent
+    assert kwargs["stream"] is True
+    assert kwargs["timeout"] == cp.DOWNLOAD_TIMEOUT
+    assert kwargs["allow_redirects"] is False
 
 
-def test_open_drive_file_needs_a_context_that_can_sign():
-    with pytest.raises(TypeError, match="API key context"):
-        cp.open_drive_file(cast(RequestContext, None), FILE_ID)
+def test_read_drive_file_splits_a_complete_response_into_blocks():
+
+    class Context(SimpleNamespace):
+        get_stream = RequestContext.get_stream
+
+        def get(self, path: str, params: object, headers: object, **kwargs: object):
+            return b"0123456789"
+
+    pieces = list(cp.read_drive_file(cast(RequestContext, Context()), FILE_ID, 4))
+
+    assert pieces == [b"0123", b"4567", b"89"]
 
 
 def test_read_drive_file_decodes_a_compressed_response(drive: FakeDrive):
@@ -1945,8 +1948,10 @@ def test_download_does_not_follow_redirects(drive: FakeDrive):
     drive.respond = respond_with(
         b"", status=302, headers={"Location": drive.url("/other")}
     )
-    with pytest.raises(HTTPError, match="redirected"):
+    with pytest.raises(HTTPError) as error:
         list(cp.read_drive_file(api_key_context(), FILE_ID, 4))
+    assert error.value.response is not None
+    assert error.value.response.status_code == 302
     assert [path for path, _ in drive.requests] == [
         f"/v1/api/ulv2/drive/file/{FILE_ID}"
     ]
@@ -2029,3 +2034,26 @@ def test_file_blocks_does_not_copy_a_large_piece_into_a_large_buffer():
     finally:
         tracemalloc.stop()
     assert peak < 64 * 1024
+
+
+@pytest.mark.parametrize("block_size", [0, -1])
+def test_read_drive_file_rejects_invalid_block_sizes(
+    monkeypatch: pytest.MonkeyPatch, block_size: int
+):
+    monkeypatch.setattr(cp, "get_file_stream", unexpected_call)
+    with pytest.raises(ValueError, match="Block size must be at least 1"):
+        list(cp.read_drive_file(cast(RequestContext, None), FILE_ID, block_size))
+
+
+def test_read_drive_file_closes_the_reader_after_an_early_stop(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    reader = io.BytesIO(b"0123456789")
+    monkeypatch.setattr(cp, "get_file_stream", lambda *args, **kwargs: reader)
+    blocks = cp.read_drive_file(cast(RequestContext, None), FILE_ID, 4)
+    try:
+        assert next(blocks) == b"0123"
+        assert not reader.closed
+    finally:
+        blocks.close()
+    assert reader.closed
