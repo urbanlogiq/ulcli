@@ -1,42 +1,69 @@
 # Copyright (c), CommunityLogiq Software
 
 import argparse
+import contextlib
+import errno
 import glob
+import os
 import os.path
+import signal
+import stat
+import threading
+import tempfile
+import unicodedata
 import urllib.parse
 import uuid
 import hashlib
-import math
 import time
 import magic
+import requests
 from abc import ABC, abstractmethod
-from typing import List, NamedTuple, Self, Sequence
+from collections import deque
+from types import FrameType
+from typing import (
+    Dict,
+    Generator,
+    Hashable,
+    Iterable,
+    Iterator,
+    List,
+    NamedTuple,
+    Optional,
+    Self,
+    Sequence,
+    Set,
+)
 from requests import HTTPError
-from flatbuffers import util
 from loguru import logger
 
 import ulcli.argparser
 from ulcli.commands.common import get_api_context
 from ulcli.commands.common import uuid_from_id
 from ulsdk.api.datacatalog import get_object
+from ulsdk.api_key_context import ApiKeyContext, _generate_auth_header
 from ulsdk.types.id import ObjectId
 from ulsdk.types.fs import ListSlot, DirectoryEntry, ListDirectory, TopLevelDirectory
-from ulsdk.request_context import RequestContext
+from ulsdk.request_context import RequestContext, _get_endpoint
 from ulsdk.api.drive import (
-    get_file,
     ls,
     get_roots,
     create_entry,
-    post_file,
     put_file_chunk,
     unlink,
 )
 
 from .utils import parse_timestamp_arg, timestamp_in_range, is_directory_entry_id
 
-
 CHUNK_SIZE = 96 * 1024 * 1024
 CHUNK_UPLOAD_ATTEMPTS = 10
+
+BLOCK_SIZE = 1024 * 1024
+PARTIAL_SUFFIX = ".ulpart"
+# Limit the temporary name to fewer than 255 bytes.
+PARTIAL_NAME_LENGTH = 48
+INTERRUPT_GRACE_SECONDS = 2.0
+DOWNLOAD_TIMEOUT = (10, 60)
+GET_FILE_PATH = "/v1/api/ulv2/drive/file/:id"
 
 # A root directory has this id as its parent.
 NIL_UUID = uuid.UUID(int=0)
@@ -44,40 +71,96 @@ NIL_UUID = uuid.UUID(int=0)
 
 class Entry(ABC):
     @abstractmethod
-    def get(self) -> bytes:
-        """Get the file content"""
+    def size(self) -> int:
+        """Return the file size in bytes."""
+
+    @abstractmethod
+    def read(self, block_size: int) -> Generator[bytes, None, None]:
+        """Read the file in blocks of at most `block_size` bytes."""
 
     @abstractmethod
     def name(self) -> str:
-        """Return the entry's name"""
+        """Return the entry name."""
 
     @abstractmethod
     def time(self) -> float:
-        """Return the time of the entry in seconds since epoch"""
+        """Return the modification time in seconds since 1970-01-01 UTC."""
 
     @abstractmethod
     def isdir(self) -> bool:
-        """Return whether or not an entry is a directory"""
+        """Return True if the entry is a directory."""
 
     @abstractmethod
-    def put(self, content: bytes, filename: str):
-        """Append a new file to the directory"""
+    def block_size(self) -> int:
+        """Return the preferred block size for this destination."""
 
     @abstractmethod
-    def collect(self) -> List[Self]:
-        """Collect all contained entries if entry is a directory, else raises an exception"""
+    def target(self, filename: str) -> Hashable:
+        """Return a key for the destination file. Copies with the same key must
+        run in order."""
+
+    @abstractmethod
+    def put(self, blocks: Iterable[bytes], size: int, filename: str):
+        """Write `blocks` to the destination, with `size` bytes in total."""
+
+    @abstractmethod
+    def collect(self) -> Sequence["Entry"]:
+        """Return the entries in this directory. Raise an error for a file."""
 
     @abstractmethod
     def mkdir(self, dir: str) -> Self:
-        """Make a directory in the current directory"""
+        """Make a directory in this directory."""
+
+
+def comparison_name(name: str) -> str:
+    """Compare names without case differences or equivalent Unicode spellings."""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def file_blocks(pieces: Iterable[bytes], size: int) -> Iterator[bytes]:
+    """Return blocks of `size` bytes. The last block can be smaller."""
+    if size < 1:
+        raise ValueError("Block size must be at least 1")
+    buffer = bytearray()
+    for piece in pieces:
+        if not buffer and len(piece) == size:
+            yield piece
+        else:
+            with memoryview(piece) as view:
+                offset = 0
+                while offset < len(view):
+                    count = min(size - len(buffer), len(view) - offset)
+                    buffer.extend(view[offset : offset + count])
+                    offset += count
+                    if len(buffer) == size:
+                        block = bytes(buffer)
+                        buffer.clear()
+                        yield block
+                        del block
+        # Release the previous block before the next read.
+        del piece
+    if buffer:
+        yield bytes(buffer)
+
+
+def check_size(blocks: Iterable[bytes], size: int) -> Iterator[bytes]:
+    """Stop the copy if the content does not match the file size."""
+    if size < 0:
+        raise ValueError("File size must not be negative")
+    received = 0
+    for block in blocks:
+        received += len(block)
+        if received > size:
+            raise OSError(f"File size changed during the copy. Expected {size} bytes.")
+        yield block
+        del block
+    if received != size:
+        raise OSError(f"File size changed during the copy. Expected {size} bytes.")
 
 
 def put_chunk(context: RequestContext, id: uuid.UUID, index: int, chunk: bytes):
-    """Upload one chunk of a file at its index.
-
-    The drive answers 514 when the hash of the bytes it received differs from
-    the hash that came with them. Only that answer is tried again.
-    """
+    """Upload one block at `index`. Retry only when the drive reports a checksum
+    error (514)."""
     hash = hashlib.sha256(chunk).hexdigest()
     for attempt in range(CHUNK_UPLOAD_ATTEMPTS):
         try:
@@ -85,24 +168,158 @@ def put_chunk(context: RequestContext, id: uuid.UUID, index: int, chunk: bytes):
             return
         except HTTPError as e:
             last_attempt = attempt == CHUNK_UPLOAD_ATTEMPTS - 1
-            if e.response.status_code != 514 or last_attempt:
+            if e.response is None or e.response.status_code != 514 or last_attempt:
                 raise
             time.sleep(1)
 
 
-def put_file(context: RequestContext, parent: uuid.UUID, content: bytes, filename: str):
-    content_len = len(content)
-    num_chunks = math.ceil(content_len / CHUNK_SIZE)
-    mime = magic.from_buffer(content, mime=True)
+def put_file(
+    context: RequestContext,
+    parent: uuid.UUID,
+    blocks: Iterable[bytes],
+    size: int,
+    filename: str,
+):
+    """Upload the file in blocks, with `size` bytes in total."""
+    num_chunks = (size + CHUNK_SIZE - 1) // CHUNK_SIZE
+    chunks = file_blocks(check_size(blocks, size), CHUNK_SIZE)
+    chunk = next(chunks, b"")
+    mime = magic.from_buffer(chunk, mime=True)
     summary = create_entry(
         context, ObjectId.from_uuid(parent), filename, "file", mime, num_chunks
     )
     id = uuid_from_id(summary.id)
     assert id
 
-    for i in range(num_chunks):
-        chunk = content[i * CHUNK_SIZE : (i + 1) * CHUNK_SIZE]
-        put_chunk(context, id, i, chunk)
+    index = 0
+    while chunk:
+        put_chunk(context, id, index, chunk)
+        index += 1
+        # Release this block before the next read.
+        del chunk
+        chunk = next(chunks, b"")
+
+
+def open_drive_file(context: RequestContext, id: uuid.UUID) -> requests.Response:
+    """Open a drive download without a copy of the complete file in memory.
+
+    The library has no public method for this operation. Reuse its request
+    signing and address lookup functions.
+    """
+    if not isinstance(context, ApiKeyContext):
+        raise TypeError("A drive download needs an API key context")
+
+    path = GET_FILE_PATH.replace(":id", str(id), 1)
+    params: Dict[str, str] = dict()
+    headers = _generate_auth_header(context._key, "GET", path, params, dict(), None)
+    endpoint = _get_endpoint(context.region(), context.env(), path)
+
+    response = requests.get(
+        endpoint,
+        params=params,
+        headers=headers,
+        stream=True,
+        timeout=DOWNLOAD_TIMEOUT,
+        allow_redirects=False,
+    )
+    try:
+        response.raise_for_status()
+        if 300 <= response.status_code < 400:
+            raise HTTPError("The drive redirected the download", response=response)
+    except BaseException:
+        response.close()
+        raise
+    return response
+
+
+def read_drive_file(
+    context: RequestContext, id: uuid.UUID, block_size: int
+) -> Generator[bytes, None, None]:
+    """Read a drive file in blocks of at most `block_size` bytes."""
+    with open_drive_file(context, id) as response:
+        yield from response.iter_content(min(block_size, BLOCK_SIZE))
+
+
+# Track temporary files for removal after cancellation.
+_partial_files: Set[str] = set()
+_partial_files_lock = threading.Lock()
+
+
+def remove_partial_files() -> None:
+    """Remove temporary files after cancellation, including those from copies
+    that cannot stop."""
+    with _partial_files_lock:
+        leftovers = list(_partial_files)
+        _partial_files.clear()
+
+    for path in leftovers:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+
+def sync_directory(directory: str) -> None:
+    """Write directory changes to disk if the system supports this operation."""
+    with contextlib.suppress(OSError):
+        fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def write_complete_file(path: str, blocks: Iterable[bytes]) -> None:
+    """Replace a file only after all content reaches disk.
+
+    Remove the temporary file if the copy fails before replacement.
+    Write directly to devices and pipes.
+    """
+    # Follow links in the path that the user supplied.
+    path = os.path.realpath(path)
+
+    try:
+        existing = os.stat(path)
+    except FileNotFoundError:
+        existing = None
+
+    # Check the destination before the first read.
+    if existing is not None and stat.S_ISDIR(existing.st_mode):
+        raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), path)
+    if existing is not None and not os.access(path, os.W_OK):
+        raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
+
+    if existing is not None and not stat.S_ISREG(existing.st_mode):
+        # Write directly to a device or pipe.
+        with open(path, "wb") as f:
+            for block in blocks:
+                f.write(block)
+        return
+
+    directory, name = os.path.split(path)
+    fd, partial = tempfile.mkstemp(
+        dir=directory, prefix=f".{name[:PARTIAL_NAME_LENGTH]}.", suffix=PARTIAL_SUFFIX
+    )
+    try:
+        with os.fdopen(fd, "wb") as f:
+            with _partial_files_lock:
+                _partial_files.add(partial)
+            for block in blocks:
+                f.write(block)
+
+            f.flush()
+            if existing is not None:
+                # Keep access permissions, but remove special execution permissions.
+                os.chmod(partial, stat.S_IMODE(existing.st_mode) & 0o777)
+            # Write the content to disk before the file replaces the destination.
+            os.fsync(f.fileno())
+
+        os.replace(partial, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(partial)
+        with _partial_files_lock:
+            _partial_files.discard(partial)
+
+    sync_directory(directory)
 
 
 def mk_dir(context: RequestContext, parent: uuid.UUID, dir: str) -> ObjectId:
@@ -137,12 +354,23 @@ class DriveEntry(Entry, Removable):
         oid = uuid_from_id(slot.id)
         assert oid is not None
         self._oid = oid
+        self._directory: Optional[uuid.UUID] = None
 
     def parent(self) -> uuid.UUID:
         return get_parent_id(self._context, self._oid)
 
-    def get(self):
-        return get_file(self._context, ObjectId.from_uuid(self._oid))
+    def directory(self) -> uuid.UUID:
+        """Return the destination directory ID. Save the result to avoid repeated
+        requests."""
+        if self._directory is None:
+            self._directory = self._oid if self.isdir() else self.parent()
+        return self._directory
+
+    def size(self):
+        return self._slot.size
+
+    def read(self, block_size: int) -> Generator[bytes, None, None]:
+        return read_drive_file(self._context, self._oid, block_size)
 
     def name(self):
         return self._slot.name
@@ -155,12 +383,15 @@ class DriveEntry(Entry, Removable):
             self._slot.entry.value, TopLevelDirectory
         )
 
-    def put(self, content: bytes, filename: str):
-        if self.isdir():
-            put_file(self._context, self._oid, content, filename)
-        else:
-            parent_id = self.parent()
-            put_file(self._context, parent_id, content, filename)
+    def block_size(self):
+        # Match the upload block size to avoid extra copies in memory.
+        return CHUNK_SIZE
+
+    def target(self, filename: str) -> Hashable:
+        return (self.directory(), comparison_name(filename))
+
+    def put(self, blocks: Iterable[bytes], size: int, filename: str):
+        put_file(self._context, self.directory(), blocks, size, filename)
 
     def collect(self) -> List["DriveEntry"]:
         assert self.isdir()
@@ -194,9 +425,13 @@ class LocalEntry(Entry):
     def __init__(self, path: str):
         self._path = os.path.realpath(path)
 
-    def get(self) -> bytes:
+    def size(self):
+        return os.path.getsize(self._path)
+
+    def read(self, block_size: int) -> Generator[bytes, None, None]:
         with open(self._path, "rb") as f:
-            return f.read()
+            # Do not retain the previous block during the next read.
+            yield from iter(lambda: f.read(block_size), b"")
 
     def name(self):
         parent, name = os.path.split(self._path)
@@ -208,33 +443,41 @@ class LocalEntry(Entry):
     def isdir(self):
         return os.path.isdir(self._path)
 
-    def put(self, content: bytes, filename: str):
-        dest_name = os.path.join(self._path, filename) if self.isdir() else self._path
-        with open(dest_name, "wb") as f:
-            f.write(content)
+    def block_size(self):
+        return BLOCK_SIZE
+
+    def child_path(self, name: str) -> str:
+        """Keep names from the drive inside this directory."""
+        if name in ("", ".", "..") or any(char in name for char in "/\\:\0"):
+            raise ValueError(f"Invalid file name: {name!r}")
+        path = os.path.join(self._path, name)
+        if os.path.commonpath([self._path, os.path.realpath(path)]) != self._path:
+            raise ValueError(f"File name points outside the destination: {name!r}")
+        return path
+
+    def path_of(self, filename: str) -> str:
+        """Return the destination path for `filename`."""
+        return self.child_path(filename) if self.isdir() else self._path
+
+    def target(self, filename: str) -> Hashable:
+        return comparison_name(os.path.realpath(self.path_of(filename)))
+
+    def put(self, blocks: Iterable[bytes], size: int, filename: str):
+        write_complete_file(self.path_of(filename), check_size(blocks, size))
 
     def collect(self) -> List["LocalEntry"]:
         return [LocalEntry(x) for x in glob.glob(os.path.join(self._path, "*"))]
 
     def mkdir(self, dir: str) -> "LocalEntry":
-        # DriveEntry.mkdir accepts a directory that already exists, so the local
-        # entry must accept one too. A recursive copy into an existing tree
-        # depends on it.
-        path = os.path.join(self._path, dir)
+        # Accept existing directories, as DriveEntry.mkdir does.
+        path = self.child_path(dir)
         os.makedirs(path, exist_ok=True)
         return LocalEntry(path)
 
 
 def get_dir_list_slot(context: RequestContext, id: str) -> DriveEntry:
-    """Resolve a bare entry id, of a file or of a directory, to its listing slot.
-
-    The drive has no endpoint that returns the listing slot of one entry, and
-    the entry object does not hold the name of the entry. The name, time and
-    size are in the listing of the parent directory. So this reads the parent
-    id from the entry object, lists the parent, and returns the slot that has
-    the id. A root directory has `NIL_UUID` as its parent and is found in the
-    list of drive roots instead.
-    """
+    """Find an entry by its ID in the parent directory. Use the drive roots if
+    the entry has no parent."""
     entry_id = uuid.UUID(id)
     parent = get_parent_id(context, entry_id)
 
@@ -252,13 +495,7 @@ def get_dir_list_slot(context: RequestContext, id: str) -> DriveEntry:
 
 
 class ResolvedArg(NamedTuple):
-    """The entries that one command line path argument resolved to.
-
-    `wildcard` records whether the argument was a wildcard pattern. A pattern
-    resolves to the matched entries themselves, while a plain path resolves to
-    the single entry that the path names. Recursive copies need to tell the two
-    apart, because `<dir>` names the directory and `<dir>/*` names its children.
-    """
+    """The entries for one path argument. A wildcard selects each entry by name."""
 
     entries: Sequence[Entry]
     wildcard: bool
@@ -277,10 +514,7 @@ def parse_files(context: RequestContext, files: List[str]) -> List[ResolvedArg]:
 
         splits = file.split("/")
 
-        # Drive location may be the bare id of one entry, a file or a
-        # directory, e.g. 05006c77-e69f-893e-40d1-842b64c961a5
-        # The parent of the entry is read from the drive, so the caller does
-        # not have to name it.
+        # An entry ID needs no parent directory in the argument.
         if is_directory_entry_id(splits[0]):
             if len(splits) > 1:
                 raise Exception(
@@ -291,15 +525,12 @@ def parse_files(context: RequestContext, files: List[str]) -> List[ResolvedArg]:
             resolved_args.append(ResolvedArg([entry], False))
             continue
 
-        # Dirve location may also be a directory id followed by a relative path, e.g.:
-        # 05006c77-e69f-893e-40d1-842b64c961a5:/Dataset upload folder/Transportation/Turning movement counts/*
+        # A drive path starts with a directory ID and a colon.
         if splits[0].endswith(":") and len(splits[0]) == 37:
-            # remote (drive) path
             root = splits[0][:-1]
             path = "/".join(splits[1:])
 
-            # The drive treats a trailing slash the same way as a trailing `*`,
-            # so both forms list the contents of the directory.
+            # A final slash or wildcard lists the drive directory contents.
             wildcard = path.endswith("*") or path.endswith("/")
 
             entries = ls(context, root, path)
@@ -314,8 +545,7 @@ def parse_files(context: RequestContext, files: List[str]) -> List[ResolvedArg]:
                 ResolvedArg([DriveEntry(context, entry) for entry in slots], wildcard)
             )
         else:
-            # local path. Unlike the drive, a local trailing slash still names
-            # the directory itself, so only a `*` expands.
+            # A local path needs a wildcard to select the directory contents.
             wildcard = "*" in file
 
             globs = glob.glob(file)
@@ -333,19 +563,164 @@ def parse_files(context: RequestContext, files: List[str]) -> List[ResolvedArg]:
     return resolved_args
 
 
-def do_cp_r(context: RequestContext, source: Entry, dest: Entry) -> bool:
-    src_entries = source.collect()
-    for src in src_entries:
+class Transfer(NamedTuple):
+    """A source file and its destination."""
+
+    source: Entry
+    dest: Entry
+
+
+class Cancelled(Exception):
+    """The copy stopped after cancellation."""
+
+
+def copy_file(transfer: Transfer, cancel: threading.Event) -> None:
+    """Copy one file. Check for cancellation before and after each read."""
+    source, dest = transfer
+    logger.info(f"Copying {source.name()}")
+
+    def check_cancelled() -> None:
+        if cancel.is_set():
+            raise Cancelled()
+
+    def copy_blocks() -> Iterator[bytes]:
+        check_cancelled()
+        for block in blocks:
+            check_cancelled()
+            yield block
+            del block
+            check_cancelled()
+        check_cancelled()
+
+    blocks = source.read(dest.block_size())
+    # Close the source after success, failure, or cancellation.
+    with contextlib.closing(blocks):
+        dest.put(copy_blocks(), source.size(), source.name())
+
+
+def plan_directory_copy(source: Entry, dest: Entry, transfers: List[Transfer]) -> None:
+    """List the files to copy and create their destination directories."""
+    for src in source.collect():
         if src.isdir():
-            dest_child = dest.mkdir(src.name())
-            do_cp_r(context, src, dest_child)
+            plan_directory_copy(src, dest.mkdir(src.name()), transfers)
         else:
-            logger.info(f"Processing {src.name()}")
+            transfers.append(Transfer(src, dest))
 
-            content = src.get()
-            dest.put(content, src.name())
 
-    return True
+def group_by_target(transfers: Sequence[Transfer]) -> List[List[Transfer]]:
+    """Group copies by destination. Keep copies to the same file in their
+    original order."""
+    groups: Dict[Hashable, List[Transfer]] = dict()
+    for transfer in transfers:
+        target = transfer.dest.target(transfer.source.name())
+        groups.setdefault(target, []).append(transfer)
+    return list(groups.values())
+
+
+def default_jobs() -> int:
+    """Return one copy per processor, or one if the processor count is unknown."""
+    return os.cpu_count() or 1
+
+
+def join_all(threads: Sequence[threading.Thread], timeout: Optional[float]) -> None:
+    """Wait at most `timeout` seconds for all threads. Short waits let Ctrl-C
+    stop the command."""
+    deadline = None if timeout is None else time.monotonic() + timeout
+    for thread in threads:
+        while thread.is_alive():
+            if deadline is not None and time.monotonic() >= deadline:
+                return
+            thread.join(0.1)
+
+
+def run_transfers(transfers: Sequence[Transfer], jobs: int) -> None:
+    """Copy at most `jobs` files at a time.
+
+    Stop new copies after a failure. Wait for active copies, then report the
+    failure."""
+    groups = deque(group_by_target(transfers))
+    num_workers = min(jobs, len(groups))
+
+    if num_workers <= 1:
+        # Use the calling thread so that Ctrl-C stops a single copy directly.
+        never = threading.Event()
+        for transfer in transfers:
+            copy_file(transfer, never)
+        return
+
+    cancel = threading.Event()
+    lock = threading.Lock()
+    failures: List[BaseException] = []
+    copied = 0
+
+    def work() -> None:
+        nonlocal copied
+        while True:
+            with lock:
+                if not groups:
+                    return
+                group = groups.popleft()
+
+            for transfer in group:
+                # Do not start another copy after a failure or cancellation.
+                if failures or cancel.is_set():
+                    return
+                try:
+                    copy_file(transfer, cancel)
+                except Cancelled:
+                    return
+                except BaseException as error:
+                    # Report failures that would otherwise end only this thread.
+                    with lock:
+                        failures.append(error)
+                    logger.error(f"Failed to copy {transfer.source.name()}: {error}")
+                    return
+                with lock:
+                    copied += 1
+
+    # Let the command exit if a network request cannot stop.
+    threads = [threading.Thread(target=work, daemon=True) for _ in range(num_workers)]
+    try:
+        for thread in threads:
+            thread.start()
+        join_all(threads, None)
+    except BaseException:
+        # Stop active copies, then remove any remaining temporary files.
+        cancel.set()
+        try:
+            join_all(threads, INTERRUPT_GRACE_SECONDS)
+        finally:
+            remove_partial_files()
+        raise
+
+    if failures:
+        logger.error(
+            f"Copied {copied} of {len(transfers)} files and stopped after a failure"
+        )
+        raise failures[0]
+
+
+@contextlib.contextmanager
+def exit_on_termination() -> Iterator[None]:
+    """Remove temporary files when SIGTERM or SIGHUP stops the command. Keep
+    existing signal handlers."""
+
+    def on_signal(signum: int, frame: Optional[FrameType]) -> None:
+        raise SystemExit(128 + signum)
+
+    replaced = dict()
+    # Only the main thread may set a signal handler.
+    if threading.current_thread() is threading.main_thread():
+        for name in ("SIGTERM", "SIGHUP"):
+            signum = getattr(signal, name, None)
+            if signum is not None and signal.getsignal(signum) == signal.SIG_DFL:
+                replaced[signum] = signal.signal(signum, on_signal)
+
+    try:
+        yield
+    finally:
+        for signum, handler in replaced.items():
+            signal.signal(signum, handler)
 
 
 def drive_cp(args: List[str]) -> bool:
@@ -356,23 +731,32 @@ def drive_cp(args: List[str]) -> bool:
     ul drive cp -profile us '05006c77-e69f-893e-40d1-842b64c961a5:/Dataset upload folder/Transportation/Turning movement counts/*' ./tmp
     ul drive cp -profile us 0500addd-0f04-fe98-4ff2-bdef69cb097d ./tmp
 
-Drive locations are specified by the prefix `<uuid>:`, where the uuid is the id
-of a root directory entry, or by the bare id of one file or directory. A bare id
-needs no parent directory: the command reads the parent from the drive. Use it
-to download one file when you know only its id. All other paths are assumed to
-be local. This bit of functionality will copy files (either one at a time or in
-bulk) from the drive to a local location, from a local location to the drive,
-or from one location in the drive to another.
+Use `<id>:/path` for a drive path, where `<id>` is the root directory ID.
+Use a file or directory ID alone if you do not know its parent path.
+Other paths refer to local files. The command can copy files between the drive
+and your computer, or between two drive locations.
 
-To play nicely with shell wildcard expansion, all paths containing wildcards
-need to be quoted. If a wildcard is used, the destination (last location) needs
-to be a directory.
+Put paths with `*` in quotes. The `*` selects all entries in a directory.
+For these paths, the destination must be a directory.
 
-With -r, the two source forms copy different things:
+With -r, these source paths select different contents:
 
-    <guid>:/folder      copies the contents of `folder` into the destination
-    <guid>:/folder/*    copies each entry in `folder` into the destination,
-                        and each matched directory keeps its own name
+    <id>:/folder      Copy the contents of `folder` into the destination.
+    <id>:/folder/*    Copy each entry in `folder` with its name intact.
+
+The command reads each file in blocks to limit memory use. Use -j to set the
+number of files to copy at the same time. Use -j 1 to copy files one at a time.
+Copies to the same destination file run in the given order.
+
+The command writes each local file to a temporary file before it replaces the
+destination. A failed copy leaves the previous file intact. Devices and pipes
+receive content directly. Only the owner can read or write a new local file.
+Existing files keep their access permissions. Copies remove special execution
+permissions. Names from the drive cannot point outside the destination directory.
+
+A forced exit can leave a hidden file named `.<name>.<random>.ulpart`.
+You can delete these incomplete files after the command stops.
+
 """
 
     parser = ulcli.argparser.ArgumentParser(
@@ -381,24 +765,38 @@ With -r, the two source forms copy different things:
         epilog=epilog,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("-r", help="recursively copy directories", action="store_true")
+    parser.add_argument(
+        "-r", help="Copy directories and their contents", action="store_true"
+    )
+    jobs = default_jobs()
+    parser.add_argument(
+        "-j",
+        help=f"Number of files to copy at the same time. Default: one per processor ({jobs} on this system)",
+        type=int,
+        default=jobs,
+        metavar="JOBS",
+    )
     parser.add_argument(
         "-start",
-        help="Earliest last modified date of files to move. Format: unix second or YYYY-MM-DD string (midnight local time)",
+        help="Copy files changed on or after this date. Use seconds since 1970-01-01 UTC or YYYY-MM-DD (local midnight).",
         type=str,
         default=None,
     )
     parser.add_argument(
         "-end",
-        help="Latest last modified date of files to move. Format: unix second or YYYY-MM-DD string (midnight local time)",
+        help="Copy files changed on or before this date. Use seconds since 1970-01-01 UTC or YYYY-MM-DD (local midnight).",
         type=str,
         default=None,
     )
     parser.add_argument(
-        "files", nargs="+", help="cp pattern. please quote all wildcards"
+        "files",
+        nargs="+",
+        help="Source paths followed by the destination. Put paths with * in quotes.",
     )
 
     parsed = parser.parse_args(args)
+    if parsed.j < 1:
+        raise Exception("-j must be at least 1")
 
     context = get_api_context(parsed)
     files = parsed.files
@@ -423,6 +821,9 @@ With -r, the two source forms copy different things:
     if earliest is not None and latest is not None and earliest > latest:
         raise Exception("Earliest timestamp must be less than latest timestamp")
 
+    # Create directories before files can copy at the same time.
+    transfers: List[Transfer] = []
+
     if parsed.r:
         if len(sources) == 0:
             raise Exception("Expected a source directory and a destination directory")
@@ -432,42 +833,39 @@ With -r, the two source forms copy different things:
 
         for arg in source_args:
             if not arg.wildcard:
-                # A plain path names one directory, and its contents merge into
-                # the destination.
+                # Copy the contents of the named directory into the destination.
                 for src in arg.entries:
                     if not src.isdir():
                         raise Exception("Source must be a directory")
 
-                    do_cp_r(context, src, dest)
+                    plan_directory_copy(src, dest, transfers)
 
                 continue
 
-            # A wildcard names the matched entries, so each one lands in the
-            # destination under its own name.
+            # Keep each name that the wildcard selects.
             for src in arg.entries:
                 if src.isdir():
-                    do_cp_r(context, src, dest.mkdir(src.name()))
+                    plan_directory_copy(src, dest.mkdir(src.name()), transfers)
                 else:
-                    logger.info(f"Processing {src.name()}")
-                    dest.put(src.get(), src.name())
+                    transfers.append(Transfer(src, dest))
+    else:
+        if len(sources) > 1:
+            if not dest.isdir():
+                raise Exception(
+                    "If copying multiple files, the destination must be a directory"
+                )
 
-        return True
+        for src in sources:
+            if src.isdir():
+                logger.warning(
+                    f"Skipped directory {src.name()}. Use -r to copy its contents."
+                )
+                continue
+            if not timestamp_in_range(src.time(), earliest, latest):
+                continue
+            transfers.append(Transfer(src, dest))
 
-    if len(sources) > 1:
-        if not dest.isdir():
-            raise Exception(
-                "If copying multiple files, the destination must be a directory"
-            )
-
-    for src in sources:
-        if src.isdir():
-            logger.warning(
-                f"Skipping copy of source {src.name()} because it is a directory. If you intended to recursively copy directory contents, use -r."
-            )
-            continue
-        if not timestamp_in_range(src.time(), earliest, latest):
-            continue
-        content = src.get()
-        dest.put(content, src.name())
+    with exit_on_termination():
+        run_transfers(transfers, parsed.j)
 
     return True
