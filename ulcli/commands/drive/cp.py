@@ -8,6 +8,7 @@ import os
 import os.path
 import signal
 import stat
+import sys
 import threading
 import tempfile
 import unicodedata
@@ -51,6 +52,7 @@ from ulsdk.api.drive import (
     unlink,
 )
 
+from .progress import Progress
 from .utils import parse_timestamp_arg, timestamp_in_range, is_directory_entry_id
 
 CHUNK_SIZE = 96 * 1024 * 1024
@@ -417,6 +419,20 @@ class LocalEntry(Entry):
     def isdir(self):
         return os.path.isdir(self._path)
 
+    def isatty(self) -> bool:
+        """Return True if the entry is a terminal."""
+        try:
+            # Open only a device. A pipe can end when a writer closes it.
+            if not stat.S_ISCHR(os.stat(self._path).st_mode):
+                return False
+            fd = os.open(self._path, os.O_WRONLY)
+        except OSError:
+            return False
+        try:
+            return os.isatty(fd)
+        finally:
+            os.close(fd)
+
     def block_size(self):
         return BLOCK_SIZE
 
@@ -548,10 +564,18 @@ class Cancelled(Exception):
     """The copy stopped after cancellation."""
 
 
-def copy_file(transfer: Transfer, cancel: threading.Event) -> None:
-    """Copy one file. Check for cancellation before and after each read."""
+def is_download(transfer: Transfer) -> bool:
+    """Return True if the copy reads a file from the drive."""
+    return isinstance(transfer.source, DriveEntry)
+
+
+def copy_file(transfer: Transfer, cancel: threading.Event, progress: Progress) -> None:
+    """Copy one file. Check for cancellation before and after each read.
+
+    Count the bytes of a download in `progress`."""
     source, dest = transfer
-    logger.info(f"Copying {source.name()}")
+    with progress.hidden():
+        logger.info(f"Copying {source.name()}")
 
     def check_cancelled() -> None:
         if cancel.is_set():
@@ -567,6 +591,8 @@ def copy_file(transfer: Transfer, cancel: threading.Event) -> None:
         check_cancelled()
 
     blocks = source.read(dest.block_size())
+    if is_download(transfer):
+        blocks = progress.track(source.name(), source.size(), blocks)
     # Close the source after success, failure, or cancellation.
     with contextlib.closing(blocks):
         dest.put(copy_blocks(), source.size(), source.name())
@@ -607,7 +633,7 @@ def join_all(threads: Sequence[threading.Thread], timeout: Optional[float]) -> N
             thread.join(0.1)
 
 
-def run_transfers(transfers: Sequence[Transfer], jobs: int) -> None:
+def run_transfers(transfers: Sequence[Transfer], jobs: int, progress: Progress) -> None:
     """Copy at most `jobs` files at a time.
 
     Stop new copies after a failure. Wait for active copies, then report the
@@ -619,7 +645,7 @@ def run_transfers(transfers: Sequence[Transfer], jobs: int) -> None:
         # Use the calling thread so that Ctrl-C stops a single copy directly.
         never = threading.Event()
         for transfer in transfers:
-            copy_file(transfer, never)
+            copy_file(transfer, never, progress)
         return
 
     cancel = threading.Event()
@@ -640,14 +666,17 @@ def run_transfers(transfers: Sequence[Transfer], jobs: int) -> None:
                 if failures or cancel.is_set():
                     return
                 try:
-                    copy_file(transfer, cancel)
+                    copy_file(transfer, cancel, progress)
                 except Cancelled:
                     return
                 except BaseException as error:
                     # Report failures that would otherwise end only this thread.
                     with lock:
                         failures.append(error)
-                    logger.error(f"Failed to copy {transfer.source.name()}: {error}")
+                    with progress.hidden():
+                        logger.error(
+                            f"Failed to copy {transfer.source.name()}: {error}"
+                        )
                     return
                 with lock:
                     copied += 1
@@ -668,9 +697,10 @@ def run_transfers(transfers: Sequence[Transfer], jobs: int) -> None:
         raise
 
     if failures:
-        logger.error(
-            f"Copied {copied} of {len(transfers)} files and stopped after a failure"
-        )
+        with progress.hidden():
+            logger.error(
+                f"Copied {copied} of {len(transfers)} files and stopped after a failure"
+            )
         raise failures[0]
 
 
@@ -721,6 +751,9 @@ With -r, these source paths select different contents:
 The command reads each file in blocks to limit memory use. Use -j to set the
 number of files to copy at the same time. Use -j 1 to copy files one at a time.
 Copies to the same destination file run in the given order.
+
+On a terminal, the command shows the progress of each active download and the
+total of all downloads. Uploads and copies to a terminal show no progress.
 
 The command writes each local file to a temporary file before it replaces the
 destination. A failed copy leaves the previous file intact. Devices and pipes
@@ -839,7 +872,12 @@ You can delete these incomplete files after the command stops.
                 continue
             transfers.append(Transfer(src, dest))
 
-    with exit_on_termination():
-        run_transfers(transfers, parsed.j)
+    sizes = [transfer.source.size() for transfer in transfers if is_download(transfer)]
+    if isinstance(dest, LocalEntry) and dest.isatty():
+        # The copy writes the files to the terminal. Do not mix progress with them.
+        sizes = []
+    progress = Progress(sys.stderr, len(sizes), sum(sizes))
+    with exit_on_termination(), progress:
+        run_transfers(transfers, parsed.j, progress)
 
     return True

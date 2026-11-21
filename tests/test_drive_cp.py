@@ -9,8 +9,10 @@ import hashlib
 import http.server
 import io
 import os
+import re
 import signal
 import stat
+import sys
 import threading
 import time
 import tracemalloc
@@ -37,8 +39,9 @@ from loguru import logger
 from requests import HTTPError, Response
 
 from ulcli.commands.common import uuid_from_id
-from ulcli.commands.drive import cp
+from ulcli.commands.drive import cp, progress
 from ulcli.commands.drive.cp import ResolvedArg, Transfer
+from ulcli.commands.drive.progress import Progress
 from ulsdk.api_key_context import ApiKeyContext
 from ulsdk.keys import Environment, Key, Region
 from ulsdk.request_context import RequestContext
@@ -136,6 +139,12 @@ def source_tree() -> FakeEntry:
     nested = geo.add(FakeEntry("nested", True))
     nested.add(FakeEntry("deep.geojson", False, b"deep"))
     return root
+
+
+def no_progress() -> Progress:
+    """A progress display that shows nothing."""
+
+    return Progress(io.StringIO(), 0, 0)
 
 
 def run_cp(
@@ -509,7 +518,6 @@ def test_parse_files_rejects_a_path_under_a_bare_id():
 def test_copy_by_file_id_downloads_the_file_into_a_local_directory(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
-
     def fake_read_drive_file(
         context: RequestContext, id: uuid.UUID, block_size: int
     ) -> Iterator[bytes]:
@@ -777,7 +785,7 @@ def test_upload_holds_one_chunk_of_a_large_file_in_memory(
     dest = cp.DriveEntry(cast(RequestContext, None), root_slot(PARENT_ID, "dir"))
     tracemalloc.start()
     try:
-        cp.copy_file(Transfer(source, dest), threading.Event())
+        cp.copy_file(Transfer(source, dest), threading.Event(), no_progress())
         _, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
@@ -790,7 +798,6 @@ def test_upload_holds_one_chunk_of_a_large_file_in_memory(
 def test_drive_to_drive_copy_regroups_the_download_into_chunks(
     monkeypatch: pytest.MonkeyPatch, uploads: List[Tuple[int, bytes]]
 ):
-
     def fake_read_drive_file(
         context: RequestContext, id: uuid.UUID, block_size: int
     ) -> Iterator[bytes]:
@@ -804,7 +811,7 @@ def test_drive_to_drive_copy_regroups_the_download_into_chunks(
     source = cp.DriveEntry(context, slot)
     dest = cp.DriveEntry(context, root_slot(PARENT_ID, "dir"))
 
-    cp.copy_file(Transfer(source, dest), threading.Event())
+    cp.copy_file(Transfer(source, dest), threading.Event(), no_progress())
 
     assert uploads == [(0, b"abcd"), (1, b"efgh"), (2, b"ij")]
 
@@ -1051,7 +1058,7 @@ def test_copy_of_a_local_file_onto_itself_keeps_its_content(tmp_path: Path):
     path.write_bytes(content)
     entry = cp.LocalEntry(str(path))
 
-    cp.copy_file(Transfer(entry, entry), threading.Event())
+    cp.copy_file(Transfer(entry, entry), threading.Event(), no_progress())
 
     assert path.read_bytes() == content
     assert os.listdir(tmp_path) == ["a.csv"]
@@ -1195,7 +1202,6 @@ def test_read_drive_file_sets_a_timeout_and_follows_no_redirect(
 
 
 def test_read_drive_file_splits_a_complete_response_into_blocks():
-
     class Context(SimpleNamespace):
         get_stream = RequestContext.get_stream
 
@@ -1321,7 +1327,7 @@ def test_a_copy_that_fails_closes_its_source(tmp_path: Path):
 
     # Retain the error to check that cleanup does not depend on memory release.
     with pytest.raises(OSError, match="disk full") as failure:
-        cp.copy_file(transfer, threading.Event())
+        cp.copy_file(transfer, threading.Event(), no_progress())
 
     assert closed == [True]
     assert failure.type is OSError
@@ -1710,7 +1716,6 @@ def test_a_failure_stops_new_copies_and_lets_the_copies_active_copies_finish(
 def test_a_worker_that_dies_of_anything_fails_the_command(
     monkeypatch: pytest.MonkeyPatch,
 ):
-
     class Fatal(BaseException):
         pass
 
@@ -1939,6 +1944,7 @@ def test_download_rejects_wrong_size_with_a_complete_response(
                 cp.DriveEntry(api_key_context(), slot), cp.LocalEntry(str(tmp_path))
             ),
             threading.Event(),
+            no_progress(),
         )
     assert path.read_bytes() == b"old"
     assert list(tmp_path.iterdir()) == [path]
@@ -2013,7 +2019,9 @@ def test_cancellation_prevents_an_empty_file_from_replacing_the_destination(
     path.write_bytes(b"old")
     with pytest.raises(cp.Cancelled):
         cp.copy_file(
-            Transfer(Source("file", False), cp.LocalEntry(str(tmp_path))), cancel
+            Transfer(Source("file", False), cp.LocalEntry(str(tmp_path))),
+            cancel,
+            no_progress(),
         )
     assert path.read_bytes() == b"old"
     assert list(tmp_path.iterdir()) == [path]
@@ -2057,3 +2065,737 @@ def test_read_drive_file_closes_the_reader_after_an_early_stop(
     finally:
         blocks.close()
     assert reader.closed
+
+
+# Show the progress of downloads on a terminal.
+
+
+class Terminal(io.StringIO):
+    """A terminal that keeps the text on its screen."""
+
+    def isatty(self) -> bool:
+        return True
+
+    def screen(self) -> List[str]:
+        """Return the rows that the terminal shows. Omit empty rows at the end."""
+
+        rows = [""]
+        row = column = 0
+        for part in re.split(r"(\x1b\[\d*[A-Z]|[\r\n])", self.getvalue()):
+            if part == "\r":
+                column = 0
+            elif part == "\n":
+                row, column = row + 1, 0
+                if row == len(rows):
+                    rows.append("")
+            elif part.startswith("\x1b["):
+                if part[-1] == "A":
+                    row -= int(part[2:-1])
+                    assert row >= 0, "The cursor moved above the first row"
+                else:
+                    assert part in ("\x1b[K", "\x1b[J"), f"Unknown command {part!r}"
+                    rows[row] = rows[row][:column]
+                    if part[-1] == "J":
+                        del rows[row + 1 :]
+            else:
+                assert "\x1b" not in part, f"Unknown command in {part!r}"
+                text = rows[row][:column].ljust(column) + part
+                rows[row] = text + rows[row][len(text) :]
+                column += len(part)
+        while rows and not rows[-1]:
+            rows.pop()
+        return rows
+
+
+@pytest.fixture
+def terminal(monkeypatch: pytest.MonkeyPatch) -> Terminal:
+    """A terminal that can change its text in place.
+
+    Stop the clock. The speed is then zero unless a test sets the time."""
+
+    monkeypatch.setenv("TERM", "xterm")
+    monkeypatch.setattr(progress, "monotonic", lambda: 0.0)
+    return Terminal()
+
+
+def blocks_of(*blocks: bytes) -> Generator[bytes, None, None]:
+    """The blocks of one file, as an entry reads them."""
+
+    yield from blocks
+
+
+def wait_until(condition: Callable[[], bool]):
+    deadline = time.monotonic() + WAIT_SECONDS
+    while not condition():
+        assert time.monotonic() < deadline, "No change before the time limit"
+        time.sleep(0.001)
+
+
+def set_terminal_size(monkeypatch: pytest.MonkeyPatch, columns: int, rows: int):
+    monkeypatch.setattr(
+        progress, "terminal_size", lambda stream: os.terminal_size((columns, rows))
+    )
+
+
+def test_progress_shows_each_active_download_and_the_total(terminal: Terminal):
+    display = Progress(terminal, 3, 4096)
+    first = display.track("first.csv", 2048, blocks_of(bytes(1024), bytes(1024)))
+    second = display.track("second.csv", 500, blocks_of(bytes(100), bytes(400)))
+    assert next(first) == bytes(1024)
+    assert next(second) == bytes(100)
+
+    display.refresh()
+
+    assert terminal.screen() == [
+        "Downloaded 0 of 3 files, 1.1 KiB of 4.0 KiB (27%), 0 B/s",
+        "  50%     1.0 KiB of 2.0 KiB     first.csv",
+        "  20%       100 B of 500 B       second.csv",
+    ]
+
+
+def test_progress_counts_a_download_that_ends_and_removes_it(terminal: Terminal):
+    display = Progress(terminal, 2, 14)
+    first = display.track("first.csv", 4, blocks_of(b"ab", b"cd"))
+    second = display.track("second.csv", 10, blocks_of(b"abc", b"defghij"))
+    assert next(first) == b"ab"
+    assert next(second) == b"abc"
+    display.refresh()
+    assert len(terminal.screen()) == 3
+
+    assert list(first) == [b"cd"]
+    display.refresh()
+
+    assert terminal.screen() == [
+        "Downloaded 1 of 2 files, 7 B of 14 B (50%), 0 B/s",
+        "  30%         3 B of 10 B        second.csv",
+    ]
+
+
+def test_progress_does_not_count_a_download_that_stops(terminal: Terminal):
+    closed: List[bool] = []
+
+    def source() -> Generator[bytes, None, None]:
+        try:
+            yield b"ab"
+            yield b"cd"
+        finally:
+            closed.append(True)
+
+    display = Progress(terminal, 1, 4)
+    # Retain the source to check that its end does not depend on memory release.
+    blocks = source()
+    download = display.track("a.csv", 4, blocks)
+    assert next(download) == b"ab"
+
+    download.close()
+    display.refresh()
+
+    assert closed == [True]
+    assert terminal.screen() == ["Downloaded 0 of 1 files, 2 B of 4 B (50%), 0 B/s"]
+
+
+def test_progress_does_not_count_a_download_that_fails(terminal: Terminal):
+    def source() -> Generator[bytes, None, None]:
+        yield b"ab"
+        raise requests.ConnectionError("connection dropped")
+
+    display = Progress(terminal, 1, 4)
+    download = display.track("a.csv", 4, source())
+    assert next(download) == b"ab"
+
+    with pytest.raises(requests.ConnectionError):
+        next(download)
+    display.refresh()
+
+    assert terminal.screen() == ["Downloaded 0 of 1 files, 2 B of 4 B (50%), 0 B/s"]
+
+
+def test_progress_leaves_the_terminal_clean_after_an_interruption(
+    monkeypatch: pytest.MonkeyPatch, terminal: Terminal
+):
+
+    # Update the display only on request.
+    monkeypatch.setattr(progress, "REFRESH_SECONDS", WAIT_SECONDS)
+    display = Progress(terminal, 1, 4)
+    download = display.track("a.csv", 4, blocks_of(b"ab", b"cd"))
+
+    with pytest.raises(KeyboardInterrupt):
+        with display:
+            assert next(download) == b"ab"
+            display.refresh()
+            assert len(terminal.screen()) == 2
+            raise KeyboardInterrupt()
+
+    assert terminal.screen() == []
+
+    # A copy that could not stop in time can continue after the display ends.
+    written = terminal.getvalue()
+    assert next(download) == b"cd"
+    with display.hidden():
+        pass
+    display.refresh()
+    assert terminal.getvalue() == written
+
+
+@pytest.mark.parametrize("case", ["file", "dumb terminal", "no downloads"])
+def test_progress_writes_nothing_without_a_terminal_or_without_downloads(
+    monkeypatch: pytest.MonkeyPatch, terminal: Terminal, case: str
+):
+
+    stream = io.StringIO() if case == "file" else terminal
+    if case == "dumb terminal":
+        monkeypatch.setenv("TERM", "dumb")
+    files = 0 if case == "no downloads" else 1
+
+    with Progress(stream, files, 4) as display:
+        assert list(display.track("a.csv", 4, blocks_of(b"ab", b"cd"))) == [
+            b"ab",
+            b"cd",
+        ]
+        with display.hidden():
+            pass
+        display.refresh()
+
+    assert stream.getvalue() == ""
+    assert threading.active_count() == 1
+
+
+def test_progress_keeps_other_output_above_the_display(terminal: Terminal):
+    display = Progress(terminal, 1, 4)
+    download = display.track("a.csv", 4, blocks_of(b"ab", b"cd"))
+    assert next(download) == b"ab"
+    display.refresh()
+
+    with display.hidden():
+        assert terminal.screen() == []
+        terminal.write("Copying b.csv\n")
+
+    expected = [
+        "Copying b.csv",
+        "Downloaded 0 of 1 files, 2 B of 4 B (50%), 0 B/s",
+        "  50%         2 B of 4 B         a.csv",
+    ]
+    assert terminal.screen() == expected
+    display.refresh()
+    assert terminal.screen() == expected
+
+
+def test_progress_shows_only_the_downloads_that_fit_in_the_rows(
+    monkeypatch: pytest.MonkeyPatch, terminal: Terminal
+):
+
+    display = Progress(terminal, 6, 60)
+    downloads = [
+        display.track(f"{number}.csv", 10, blocks_of(b"x")) for number in range(6)
+    ]
+    for download in downloads:
+        assert next(download) == b"x"
+    total = "Downloaded 0 of 6 files, 6 B of 60 B (10%), 0 B/s"
+    files = [f"  10%         1 B of 10 B        {number}.csv" for number in range(6)]
+
+    # One row stays free for the cursor.
+    set_terminal_size(monkeypatch, 80, 5)
+    display.refresh()
+    assert terminal.screen() == [total] + files[:2] + ["  and 4 more"]
+
+    set_terminal_size(monkeypatch, 80, 8)
+    display.refresh()
+    assert terminal.screen() == [total] + files
+
+    set_terminal_size(monkeypatch, 80, 7)
+    display.refresh()
+    assert terminal.screen() == [total] + files[:4] + ["  and 2 more"]
+
+    set_terminal_size(monkeypatch, 80, 2)
+    display.refresh()
+    assert terminal.screen() == [total]
+
+    set_terminal_size(monkeypatch, 80, 1)
+    display.refresh()
+    assert terminal.screen() == []
+
+
+def test_progress_shows_an_empty_file_as_complete(terminal: Terminal):
+    display = Progress(terminal, 1, 0)
+    seen: List[List[str]] = []
+
+    def source() -> Generator[bytes, None, None]:
+        display.refresh()
+        seen.append(terminal.screen())
+        yield from ()
+
+    assert list(display.track("empty.txt", 0, source())) == []
+
+    assert seen == [
+        [
+            "Downloaded 0 of 1 files, 0 B of 0 B (100%), 0 B/s",
+            " 100%         0 B of 0 B         empty.txt",
+        ]
+    ]
+
+
+def test_progress_cuts_each_line_to_the_width_of_the_terminal(
+    monkeypatch: pytest.MonkeyPatch, terminal: Terminal
+):
+
+    set_terminal_size(monkeypatch, 40, 24)
+    display = Progress(terminal, 2, 8)
+    long = display.track("a-long-name-" * 5, 4, blocks_of(b"ab"))
+    wide = display.track("報告書" * 5, 4, blocks_of(b"ab"))
+    assert next(long) == b"ab"
+    assert next(wide) == b"ab"
+
+    display.refresh()
+
+    # The last column stays free, and a wide character uses two columns.
+    assert terminal.screen() == [
+        "Downloaded 0 of 2 files, 4 B of 8 B (50",
+        "  50%         2 B of 4 B         a-long",
+        "  50%         2 B of 4 B         報告書",
+    ]
+
+
+@pytest.mark.parametrize(
+    "text,columns,expected",
+    [
+        ("", 0, ""),
+        ("abc", 0, ""),
+        ("abc", 2, "ab"),
+        ("abc", 3, "abc"),
+        ("abc", 9, "abc"),
+        ("報告書", 3, "報"),
+        ("報告書", 4, "報告"),
+        ("a報告", 2, "a"),
+        ("é", 1, ""),
+    ],
+)
+def test_fit_cuts_text_to_a_number_of_columns(text: str, columns: int, expected: str):
+    assert progress.fit(text, columns) == expected
+
+
+def test_progress_replaces_characters_that_can_change_the_terminal(
+    terminal: Terminal,
+):
+    display = Progress(terminal, 1, 4)
+    download = display.track("a\x1b[2J\r\n\tb\x7f.csv", 4, blocks_of(b"ab"))
+    assert next(download) == b"ab"
+
+    display.refresh()
+
+    assert terminal.screen() == [
+        "Downloaded 0 of 1 files, 2 B of 4 B (50%), 0 B/s",
+        "  50%         2 B of 4 B         a?[2J???b?.csv",
+    ]
+
+
+def test_progress_shows_the_speed_and_the_time_left(
+    monkeypatch: pytest.MonkeyPatch, terminal: Terminal
+):
+
+    megabyte = bytes(1024 * 1024)
+    times = iter([10.0, 12.0])
+    monkeypatch.setattr(progress, "monotonic", lambda: next(times))
+    display = Progress(terminal, 1, 5 * len(megabyte))
+    download = display.track("a.bin", 5 * len(megabyte), blocks_of(megabyte, megabyte))
+
+    display.refresh()
+    assert next(download) == megabyte
+    display.refresh()
+
+    assert terminal.screen()[0] == (
+        "Downloaded 0 of 1 files, 1.0 MiB of 5.0 MiB (20%), 512.0 KiB/s, 0:08 left"
+    )
+
+
+def test_progress_rounds_the_time_left_up(
+    monkeypatch: pytest.MonkeyPatch, terminal: Terminal
+):
+
+    times = iter([0.0, 1.0])
+    monkeypatch.setattr(progress, "monotonic", lambda: next(times))
+    display = Progress(terminal, 1, 150)
+    download = display.track("a.bin", 150, blocks_of(bytes(100), bytes(50)))
+
+    display.refresh()
+    assert next(download) == bytes(100)
+    display.refresh()
+
+    # Half a second of the download remains.
+    assert terminal.screen()[0].endswith("(66%), 100 B/s, 0:01 left")
+
+
+def test_progress_measures_the_speed_over_the_last_seconds_only(
+    monkeypatch: pytest.MonkeyPatch, terminal: Terminal
+):
+
+    # Keep three measurements.
+    monkeypatch.setattr(progress, "SPEED_SECONDS", 2 * progress.REFRESH_SECONDS)
+    times = iter([0.0, 1.0, 2.0, 3.0])
+    monkeypatch.setattr(progress, "monotonic", lambda: next(times))
+    display = Progress(terminal, 1, 200)
+    download = display.track("a.bin", 200, blocks_of(bytes(100), bytes(100)))
+
+    display.refresh()
+    assert next(download) == bytes(100)
+    display.refresh()
+    assert terminal.screen()[0].endswith("(50%), 100 B/s, 0:01 left")
+    display.refresh()
+    assert terminal.screen()[0].endswith("(50%), 50 B/s, 0:02 left")
+
+    # The download made no progress in the last two seconds.
+    display.refresh()
+    assert terminal.screen()[0].endswith("(50%), 0 B/s")
+
+
+def test_progress_shows_no_time_left_at_a_very_low_speed(
+    monkeypatch: pytest.MonkeyPatch, terminal: Terminal
+):
+
+    times = iter([0.0, 5.0])
+    monkeypatch.setattr(progress, "monotonic", lambda: next(times))
+    size = 1024**4
+    display = Progress(terminal, 1, size)
+    download = display.track("a.bin", size, blocks_of(b"x"))
+
+    display.refresh()
+    assert next(download) == b"x"
+    display.refresh()
+
+    assert terminal.screen()[0] == (
+        "Downloaded 0 of 1 files, 1 B of 1.0 TiB (0%), 0 B/s"
+    )
+
+
+def test_progress_updates_the_display_at_intervals(
+    monkeypatch: pytest.MonkeyPatch, terminal: Terminal
+):
+
+    monkeypatch.setattr(progress, "REFRESH_SECONDS", 0.001)
+
+    with Progress(terminal, 1, 4) as display:
+        download = display.track("a.csv", 4, blocks_of(b"ab", b"cd"))
+        assert next(download) == b"ab"
+        wait_until(
+            lambda: terminal.screen()
+            == [
+                "Downloaded 0 of 1 files, 2 B of 4 B (50%), 0 B/s",
+                "  50%         2 B of 4 B         a.csv",
+            ]
+        )
+
+        assert list(download) == [b"cd"]
+        wait_until(
+            lambda: terminal.screen()
+            == ["Downloaded 1 of 1 files, 4 B of 4 B (100%), 0 B/s"]
+        )
+
+    assert terminal.screen() == []
+    assert threading.active_count() == 1
+
+
+def test_a_terminal_that_fails_does_not_stop_a_download(terminal: Terminal):
+    class Broken(Terminal):
+        def write(self, text: str) -> int:
+            raise OSError("the terminal closed")
+
+    with Progress(Broken(), 1, 4) as display:
+        download = display.track("a.csv", 4, blocks_of(b"ab", b"cd"))
+        assert next(download) == b"ab"
+        display.refresh()
+        with display.hidden():
+            pass
+        assert list(download) == [b"cd"]
+
+
+def test_a_terminal_that_is_slow_does_not_delay_a_download(terminal: Terminal):
+    writing = threading.Event()
+    release = threading.Event()
+
+    class Slow(Terminal):
+        def write(self, text: str) -> int:
+            writing.set()
+            # Wait longer than the test waits for the download.
+            release.wait(2 * WAIT_SECONDS)
+            return super().write(text)
+
+    display = Progress(Slow(), 1, 4)
+    received: List[bytes] = []
+    refresh = threading.Thread(target=display.refresh)
+    download = threading.Thread(
+        target=lambda: received.extend(
+            display.track("a.csv", 4, blocks_of(b"ab", b"cd"))
+        )
+    )
+
+    try:
+        refresh.start()
+        wait_for(writing)
+        download.start()
+        download.join(WAIT_SECONDS)
+        assert received == [b"ab", b"cd"]
+    finally:
+        release.set()
+        refresh.join(WAIT_SECONDS)
+        download.join(WAIT_SECONDS)
+
+
+def test_terminal_size_has_a_default_for_an_unknown_size(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+
+    # This stream has no file descriptor.
+    assert progress.terminal_size(io.StringIO()) == (80, 24)
+
+    # Some terminals report a size of zero.
+    monkeypatch.setattr(os, "get_terminal_size", lambda fd: os.terminal_size((0, 0)))
+    with open(tmp_path / "terminal", "w") as stream:
+        assert progress.terminal_size(stream) == (80, 24)
+
+    monkeypatch.setattr(os, "get_terminal_size", lambda fd: os.terminal_size((132, 50)))
+    with open(tmp_path / "terminal", "w") as stream:
+        assert progress.terminal_size(stream) == (132, 50)
+
+
+@pytest.mark.parametrize(
+    "size,expected",
+    [
+        (0, "0 B"),
+        (1023, "1023 B"),
+        (1024, "1.0 KiB"),
+        (1536, "1.5 KiB"),
+        (1024**2 - 1, "1.0 MiB"),
+        (5 * 1024**3, "5.0 GiB"),
+        (1024**4, "1.0 TiB"),
+        (2048 * 1024**4, "2048.0 TiB"),
+        (1023.99, "1.0 KiB"),
+        (0.5, "0 B"),
+    ],
+)
+def test_format_size_uses_binary_units(size: float, expected: str):
+    assert progress.format_size(size) == expected
+
+
+@pytest.mark.parametrize(
+    "seconds,expected",
+    [
+        (0, "0:00"),
+        (59.9, "0:59"),
+        (61, "1:01"),
+        (3599, "59:59"),
+        (3600, "1:00:00"),
+        (3725, "1:02:05"),
+    ],
+)
+def test_format_time_omits_zero_hours(seconds: float, expected: str):
+    assert progress.format_time(seconds) == expected
+
+
+def test_copy_file_counts_the_bytes_of_a_download(
+    monkeypatch: pytest.MonkeyPatch, terminal: Terminal
+):
+
+    display = Progress(terminal, 1, 10)
+    seen: List[List[str]] = []
+
+    def fake_read_drive_file(
+        context: RequestContext, id: uuid.UUID, block_size: int
+    ) -> Iterator[bytes]:
+        yield b"abc"
+        display.refresh()
+        seen.append(terminal.screen())
+        yield b"defghij"
+
+    monkeypatch.setattr(cp, "read_drive_file", fake_read_drive_file)
+    slot = file_slot(FILE_ID, "a.csv", size=10)
+    source = cp.DriveEntry(cast(RequestContext, None), slot)
+    dest = FakeEntry("dest", True)
+
+    cp.copy_file(Transfer(source, dest), threading.Event(), display)
+    display.refresh()
+
+    assert flatten(dest) == {"a.csv": b"abcdefghij"}
+    assert seen == [
+        [
+            "Downloaded 0 of 1 files, 3 B of 10 B (30%), 0 B/s",
+            "  30%         3 B of 10 B        a.csv",
+        ]
+    ]
+    assert terminal.screen() == ["Downloaded 1 of 1 files, 10 B of 10 B (100%), 0 B/s"]
+
+
+def test_copy_file_shows_no_progress_for_a_source_outside_the_drive(
+    terminal: Terminal,
+):
+    display = Progress(terminal, 1, 10)
+
+    class Source(FakeEntry):
+        def read(self, block_size: int) -> Generator[bytes, None, None]:
+            yield b"abc"
+            display.refresh()
+            yield b"d"
+
+    source = Source("local.csv", False, b"abcd")
+    dest = FakeEntry("dest", True)
+
+    cp.copy_file(Transfer(source, dest), threading.Event(), display)
+
+    assert flatten(dest) == {"local.csv": b"abcd"}
+    assert terminal.screen() == ["Downloaded 0 of 1 files, 0 B of 10 B (0%), 0 B/s"]
+
+
+def test_drive_cp_shows_the_progress_of_a_download_and_removes_it(
+    monkeypatch: pytest.MonkeyPatch, terminal: Terminal
+):
+
+    # The total counts only the download.
+    during_the_download = [
+        "Copying a.csv",
+        "Downloaded 0 of 1 files, 3 B of 4 B (75%), 0 B/s",
+        "  75%         3 B of 4 B         a.csv",
+    ]
+    shown: List[bool] = []
+
+    def fake_read_drive_file(
+        context: RequestContext, id: uuid.UUID, block_size: int
+    ) -> Iterator[bytes]:
+        yield b"abc"
+        # The command shows this block without a request.
+        wait_until(lambda: terminal.screen() == during_the_download)
+        shown.append(True)
+        yield b"d"
+
+    monkeypatch.setattr(sys, "stderr", terminal)
+    monkeypatch.setattr(progress, "REFRESH_SECONDS", 0.001)
+    monkeypatch.setattr(cp, "read_drive_file", fake_read_drive_file)
+    context = cast(RequestContext, None)
+    sources = [
+        cp.DriveEntry(context, file_slot(FILE_ID, "a.csv", size=4)),
+        FakeEntry("local.csv", False, b"local"),
+    ]
+    dest = FakeEntry("dest", True)
+    resolved = [ResolvedArg(sources, True), ResolvedArg([dest], False)]
+    sink = logger.add(terminal, format="{message}")
+
+    try:
+        assert run_cp(monkeypatch, ["-j", "1", "folder/*", "dest"], resolved)
+    finally:
+        logger.remove(sink)
+
+    assert flatten(dest) == {"a.csv": b"abcd", "local.csv": b"local"}
+    assert shown == [True]
+    assert terminal.screen() == ["Copying a.csv", "Copying local.csv"]
+    assert threading.active_count() == 1
+
+
+def test_drive_cp_writes_no_progress_without_a_download(
+    monkeypatch: pytest.MonkeyPatch, terminal: Terminal
+):
+
+    monkeypatch.setattr(sys, "stderr", terminal)
+    sources = [FakeEntry("a.csv", False, b"abc")]
+    dest = FakeEntry("dest", True)
+    resolved = [ResolvedArg(sources, False), ResolvedArg([dest], False)]
+
+    assert run_cp(monkeypatch, ["a.csv", "dest"], resolved)
+
+    assert flatten(dest) == {"a.csv": b"abc"}
+    assert terminal.getvalue() == ""
+
+
+def test_local_entry_knows_if_it_is_a_terminal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+
+    controller, device = os.openpty()
+    try:
+        assert cp.LocalEntry(os.ttyname(device)).isatty()
+    finally:
+        os.close(controller)
+        os.close(device)
+    assert not cp.LocalEntry(os.devnull).isatty()
+
+    (tmp_path / "file").write_bytes(b"content")
+    os.mkfifo(tmp_path / "pipe")
+    # An open can change the state of a pipe, so the entry opens only devices.
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", unexpected_call)
+        for name in ("file", "pipe", "missing", "."):
+            assert not cp.LocalEntry(str(tmp_path / name)).isatty()
+    assert (tmp_path / "file").read_bytes() == b"content"
+
+
+def test_drive_cp_shows_no_progress_for_a_copy_to_a_terminal(
+    monkeypatch: pytest.MonkeyPatch, terminal: Terminal
+):
+    def fake_read_drive_file(
+        context: RequestContext, id: uuid.UUID, block_size: int
+    ) -> Iterator[bytes]:
+        yield from (b"ab", b"cd")
+
+    monkeypatch.setattr(sys, "stderr", terminal)
+    monkeypatch.setattr(cp, "read_drive_file", fake_read_drive_file)
+    context = cast(RequestContext, None)
+    sources = [cp.DriveEntry(context, file_slot(FILE_ID, "a.csv", size=4))]
+    controller, device = os.openpty()
+    try:
+        dest = cp.LocalEntry(os.ttyname(device))
+        resolved = [ResolvedArg(sources, False), ResolvedArg([dest], False)]
+
+        assert run_cp(monkeypatch, ["a.csv", "terminal"], resolved)
+
+        # The terminal received the file.
+        assert os.read(controller, 16) == b"abcd"
+    finally:
+        os.close(controller)
+        os.close(device)
+    assert terminal.getvalue() == ""
+
+
+def test_log_messages_stay_complete_above_the_progress_display(
+    monkeypatch: pytest.MonkeyPatch, terminal: Terminal
+):
+
+    slow_started = threading.Event()
+    failure_logged = threading.Event()
+
+    def write_log(message: str):
+        terminal.write(message)
+        if "Failed to copy" in message:
+            failure_logged.set()
+
+    def fake_read_drive_file(
+        context: RequestContext, id: uuid.UUID, block_size: int
+    ) -> Iterator[bytes]:
+        if id == FILE_ID:
+            wait_for(slow_started)
+            raise IOError("the drive said no")
+        slow_started.set()
+        yield b"sl"
+        wait_for(failure_logged)
+        yield b"ow"
+
+    monkeypatch.setattr(sys, "stderr", terminal)
+    monkeypatch.setattr(progress, "REFRESH_SECONDS", 0.001)
+    monkeypatch.setattr(cp, "read_drive_file", fake_read_drive_file)
+    context = cast(RequestContext, None)
+    sources = [
+        cp.DriveEntry(context, file_slot(FILE_ID, "bad.csv", size=3)),
+        cp.DriveEntry(context, file_slot(OTHER_ID, "slow.csv", size=4)),
+    ]
+    dest = FakeEntry("dest", True)
+    resolved = [ResolvedArg(sources, True), ResolvedArg([dest], False)]
+    sink = logger.add(write_log, format="{message}")
+
+    try:
+        with pytest.raises(IOError, match="the drive said no"):
+            run_cp(monkeypatch, ["-j", "2", "folder/*", "dest"], resolved)
+    finally:
+        logger.remove(sink)
+
+    assert flatten(dest) == {"slow.csv": b"slow"}
+    rows = terminal.screen()
+    assert sorted(rows[:2]) == ["Copying bad.csv", "Copying slow.csv"]
+    assert rows[2:] == [
+        "Failed to copy bad.csv: the drive said no",
+        "Copied 1 of 2 files and stopped after a failure",
+    ]
