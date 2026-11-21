@@ -13,14 +13,14 @@ from typing import Deque, Generator, Iterator, List, Self, TextIO, Tuple
 REFRESH_SECONDS = 0.2
 # Calculate the speed from this many seconds of downloads.
 SPEED_SECONDS = 5
-# Show no time left from this value up. The speed is too low to estimate it.
+# Do not show a time estimate of 100 hours or more.
 LONGEST_TIME_LEFT = 100 * 60 * 60
 
 UNITS = ("B", "KiB", "MiB", "GiB", "TiB")
 
 
 def format_size(size: float) -> str:
-    """Return a number of bytes with a binary unit."""
+    """Return the size in bytes or units of 1024 bytes."""
     unit = 0
     # Change the unit before one decimal place shows 1024.0.
     while size >= 1023.95 and unit < len(UNITS) - 1:
@@ -30,7 +30,7 @@ def format_size(size: float) -> str:
 
 
 def format_time(seconds: float) -> str:
-    """Return a duration as h:mm:ss. Omit the hours if they are zero."""
+    """Return the time as h:mm:ss. If the hours are zero, use mm:ss."""
     minutes, seconds = divmod(int(seconds), 60)
     hours, minutes = divmod(minutes, 60)
     if hours:
@@ -39,20 +39,19 @@ def format_time(seconds: float) -> str:
 
 
 def percent(part: int, whole: int) -> int:
-    """Return `part` as a percentage of `whole`. An empty whole is complete."""
+    """Return the percentage. Use 100 if the total is zero."""
     return part * 100 // whole if whole else 100
 
 
 def printable(text: str) -> str:
-    """Replace the characters that a terminal does not show as text. Such a
-    character can move the cursor."""
+    """Replace characters that can control the terminal with question marks."""
     return "".join(char if char.isprintable() else "?" for char in text)
 
 
 def fit(text: str, columns: int) -> str:
     """Cut `text` to at most `columns` terminal columns.
 
-    Count two columns for each character outside ASCII, because some are wide."""
+    Use extra space for characters that can need two columns."""
     width = 0
     for index, char in enumerate(text):
         width += 1 if char.isascii() else 2
@@ -63,12 +62,14 @@ def fit(text: str, columns: int) -> str:
 
 def is_terminal(stream: TextIO) -> bool:
     """Return True if `stream` is a terminal that can change its text in place."""
-    return stream.isatty() and os.environ.get("TERM") != "dumb"
+    try:
+        return stream.isatty() and os.environ.get("TERM") != "dumb"
+    except (OSError, ValueError):
+        return False
 
 
 def terminal_size(stream: TextIO) -> os.terminal_size:
-    """Return the size of the terminal, or 80 columns and 24 rows if it is
-    unknown."""
+    """Return the terminal size. Use 80 columns and 24 rows if the size is unknown."""
     try:
         size = os.get_terminal_size(stream.fileno())
     except (OSError, ValueError):
@@ -79,7 +80,7 @@ def terminal_size(stream: TextIO) -> os.terminal_size:
 
 
 class Download:
-    """One active download."""
+    """Store the name, size, and byte count of one download."""
 
     def __init__(self, name: str, size: int):
         self.name = name
@@ -104,14 +105,11 @@ class Progress:
         self._done = 0
         self._received = 0
 
-        # This lock protects the terminal and the values below. Downloads do
-        # not wait for it, so a slow terminal does not slow them down.
+        # Use a separate lock for the terminal. Downloads can still update the counts.
         self._terminal = threading.Lock()
         self._enabled = files > 0 and is_terminal(stream)
         self._shown = 0
-        self._samples: Deque[Tuple[float, int]] = deque(
-            maxlen=round(SPEED_SECONDS / REFRESH_SECONDS) + 1
-        )
+        self._measurements: Deque[Tuple[float, int]] = deque()
         self._speed = 0.0
 
         self._stop = threading.Event()
@@ -133,13 +131,16 @@ class Progress:
     def track(
         self, name: str, size: int, blocks: Generator[bytes, None, None]
     ) -> Generator[bytes, None, None]:
-        """Yield the blocks of one download and count their bytes.
+        """Return the blocks of one download and count their bytes.
 
         Close `blocks` when the download ends or stops."""
+        if not self._enabled:
+            with contextlib.closing(blocks):
+                yield from blocks
+            return
         download = Download(printable(name), size)
         with self._lock:
             self._active.append(download)
-        done = 0
         try:
             with contextlib.closing(blocks):
                 for block in blocks:
@@ -149,15 +150,22 @@ class Progress:
                     yield block
                     # Release this block before the next read.
                     del block
-            done = 1
         finally:
             with self._lock:
                 self._active.remove(download)
-                self._done += done
+
+    def complete(self) -> None:
+        """Count a download only after the destination accepts the file."""
+        if self._enabled:
+            with self._lock:
+                self._done += 1
 
     @contextlib.contextmanager
     def hidden(self) -> Iterator[None]:
         """Remove the display while the caller writes to the terminal."""
+        if not self._enabled:
+            yield
+            return
         with self._terminal:
             self._erase()
             try:
@@ -168,10 +176,18 @@ class Progress:
     def refresh(self) -> None:
         """Measure the speed and show the current state."""
         with self._terminal:
+            if not self._enabled:
+                return
             with self._lock:
                 received = self._received
-            self._samples.append((monotonic(), received))
-            (start, before), (end, after) = self._samples[0], self._samples[-1]
+            now = monotonic()
+            measurements = self._measurements
+            # Limit the number of measurements, even with frequent display updates.
+            if not measurements or now - measurements[-1][0] >= REFRESH_SECONDS:
+                measurements.append((now, received))
+            while len(measurements) > 1 and measurements[0][0] < now - SPEED_SECONDS:
+                measurements.popleft()
+            (start, before), (end, after) = measurements[0], measurements[-1]
             self._speed = (after - before) / (end - start) if end > start else 0.0
             self._draw()
 
@@ -196,8 +212,7 @@ class Progress:
                 # Show zero only when the downloads are complete.
                 total += f", {format_time(math.ceil(left))} left"
 
-        # If the downloads do not all fit, the last line gives the number of
-        # downloads that the display omits.
+        # If some downloads do not fit, show their count on the last line.
         room = capacity - 1
         shown = active if len(active) <= room else active[: max(room - 1, 0)]
         lines = [total] + [
@@ -214,8 +229,8 @@ class Progress:
         if not self._enabled:
             return
         columns, rows = terminal_size(self._stream)
-        # Keep the last column free, so that no line continues on the next
-        # row. Keep one row for the cursor below the display.
+        # Keep the last column free to prevent extra rows.
+        # Keep one row for the cursor below the display.
         lines = [fit(line, columns - 1) for line in self._lines(rows - 1)]
         text = "".join(f"{line}\x1b[K\n" for line in lines)
         self._write(f"{self._top()}{text}\x1b[J")

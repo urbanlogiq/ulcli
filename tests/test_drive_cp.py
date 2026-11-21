@@ -142,7 +142,7 @@ def source_tree() -> FakeEntry:
 
 
 def no_progress() -> Progress:
-    """A progress display that shows nothing."""
+    """Return a progress display that shows nothing."""
 
     return Progress(io.StringIO(), 0, 0)
 
@@ -2071,13 +2071,13 @@ def test_read_drive_file_closes_the_reader_after_an_early_stop(
 
 
 class Terminal(io.StringIO):
-    """A terminal that keeps the text on its screen."""
+    """Keep the text that a terminal shows on its screen."""
 
     def isatty(self) -> bool:
         return True
 
     def screen(self) -> List[str]:
-        """Return the rows that the terminal shows. Omit empty rows at the end."""
+        """Return the rows that the terminal shows. Remove empty rows at the end."""
 
         rows = [""]
         row = column = 0
@@ -2109,7 +2109,7 @@ class Terminal(io.StringIO):
 
 @pytest.fixture
 def terminal(monkeypatch: pytest.MonkeyPatch) -> Terminal:
-    """A terminal that can change its text in place.
+    """Return a terminal that can change its text in place.
 
     Stop the clock. The speed is then zero unless a test sets the time."""
 
@@ -2119,7 +2119,7 @@ def terminal(monkeypatch: pytest.MonkeyPatch) -> Terminal:
 
 
 def blocks_of(*blocks: bytes) -> Generator[bytes, None, None]:
-    """The blocks of one file, as an entry reads them."""
+    """Return the blocks of one file."""
 
     yield from blocks
 
@@ -2163,6 +2163,7 @@ def test_progress_counts_a_download_that_ends_and_removes_it(terminal: Terminal)
     assert len(terminal.screen()) == 3
 
     assert list(first) == [b"cd"]
+    display.complete()
     display.refresh()
 
     assert terminal.screen() == [
@@ -2182,7 +2183,7 @@ def test_progress_does_not_count_a_download_that_stops(terminal: Terminal):
             closed.append(True)
 
     display = Progress(terminal, 1, 4)
-    # Retain the source to check that its end does not depend on memory release.
+    # Keep the source object to make sure that the download closes it.
     blocks = source()
     download = display.track("a.csv", 4, blocks)
     assert next(download) == b"ab"
@@ -2428,8 +2429,7 @@ def test_progress_measures_the_speed_over_the_last_seconds_only(
     monkeypatch: pytest.MonkeyPatch, terminal: Terminal
 ):
 
-    # Keep three measurements.
-    monkeypatch.setattr(progress, "SPEED_SECONDS", 2 * progress.REFRESH_SECONDS)
+    monkeypatch.setattr(progress, "SPEED_SECONDS", 2)
     times = iter([0.0, 1.0, 2.0, 3.0])
     monkeypatch.setattr(progress, "monotonic", lambda: next(times))
     display = Progress(terminal, 1, 200)
@@ -2484,6 +2484,7 @@ def test_progress_updates_the_display_at_intervals(
         )
 
         assert list(download) == [b"cd"]
+        display.complete()
         wait_until(
             lambda: terminal.screen()
             == ["Downloaded 1 of 1 files, 4 B of 4 B (100%), 0 B/s"]
@@ -2571,7 +2572,7 @@ def test_terminal_size_has_a_default_for_an_unknown_size(
         (0.5, "0 B"),
     ],
 )
-def test_format_size_uses_binary_units(size: float, expected: str):
+def test_format_size_uses_units_of_1024_bytes(size: float, expected: str):
     assert progress.format_size(size) == expected
 
 
@@ -2799,3 +2800,130 @@ def test_log_messages_stay_complete_above_the_progress_display(
         "Failed to copy bad.csv: the drive said no",
         "Copied 1 of 2 files and stopped after a failure",
     ]
+
+
+def test_copy_messages_replace_terminal_commands():
+    name = "report\x1b[2J\n.csv"
+    source = FakeEntry(name, False, b"data")
+    output = io.StringIO()
+    sink = logger.add(output, format="{message}")
+    try:
+        cp.copy_file(
+            Transfer(source, FakeEntry("dest", True)), threading.Event(), no_progress()
+        )
+    finally:
+        logger.remove(sink)
+
+    assert output.getvalue() == "Copying report?[2J?.csv\n"
+
+
+def test_copy_failure_messages_replace_terminal_commands():
+    class Failing(FakeEntry):
+        def put(self, blocks: Iterable[bytes], size: int, filename: str):
+            if filename.startswith("a"):
+                raise OSError("denied\x1b]52;c;YQ==\x07\nend")
+            super().put(blocks, size, filename)
+
+    sources = [FakeEntry("a\x1b[2J.csv", False), FakeEntry("b.csv", False)]
+    dest = Failing("dest", True)
+    output = io.StringIO()
+    sink = logger.add(output, format="{message}")
+    try:
+        with pytest.raises(OSError):
+            cp.run_transfers(
+                [Transfer(source, dest) for source in sources], 2, no_progress()
+            )
+    finally:
+        logger.remove(sink)
+
+    text = output.getvalue()
+    assert "Failed to copy a?[2J.csv: denied?]52;c;YQ==??end\n" in text
+    assert "\x1b" not in text
+    assert "\x07" not in text
+
+
+@pytest.mark.parametrize("failure", ["size", "write"])
+def test_failed_downloads_do_not_count_as_complete(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, terminal: Terminal, failure: str
+):
+    def read(context: RequestContext, id: uuid.UUID, block_size: int):
+        yield b"data"
+
+    def fail_replace(source: str, dest: str):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(cp, "read_drive_file", read)
+    size = 5 if failure == "size" else 4
+    if failure == "write":
+        monkeypatch.setattr(os, "replace", fail_replace)
+    source = cp.DriveEntry(
+        cast(RequestContext, None), file_slot(FILE_ID, "a.csv", size=size)
+    )
+    display = Progress(terminal, 1, size)
+
+    with pytest.raises(OSError):
+        cp.copy_file(
+            Transfer(source, cp.LocalEntry(str(tmp_path))), threading.Event(), display
+        )
+    display.refresh()
+
+    assert terminal.screen()[0].startswith("Downloaded 0 of 1 files,")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_progress_discards_speed_measurements_after_a_delay(
+    monkeypatch: pytest.MonkeyPatch, terminal: Terminal
+):
+    times = iter([0.0, 1.0, 10.0])
+    monkeypatch.setattr(progress, "monotonic", lambda: next(times))
+    display = Progress(terminal, 1, 200)
+    download = display.track("a.csv", 200, blocks_of(bytes(100), bytes(100)))
+
+    display.refresh()
+    assert next(download) == bytes(100)
+    display.refresh()
+    assert terminal.screen()[0].endswith("100 B/s, 0:01 left")
+    display.refresh()
+
+    assert terminal.screen()[0].endswith("0 B/s")
+
+
+def test_terminal_check_does_not_wait_if_a_device_becomes_a_pipe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    path = tmp_path / "pipe"
+    os.mkfifo(path)
+    entry = cp.LocalEntry(str(path))
+    get_status = os.stat
+
+    def device_status(name, *args, **kwargs):
+        if name == str(path):
+            return SimpleNamespace(st_mode=stat.S_IFCHR)
+        return get_status(name, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", device_status)
+    results: List[bool] = []
+    thread = threading.Thread(
+        target=lambda: results.append(entry.isatty()), daemon=True
+    )
+    thread.start()
+    try:
+        thread.join(1)
+        assert results == [False]
+    finally:
+        # Release a writer if the test fails because the open waits for a reader.
+        reader = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            thread.join(WAIT_SECONDS)
+        finally:
+            os.close(reader)
+
+
+def test_progress_accepts_a_closed_output_stream():
+    stream = io.StringIO()
+    stream.close()
+
+    with Progress(stream, 1, 4) as display:
+        assert list(display.track("a.csv", 4, blocks_of(b"data"))) == [b"data"]
+        display.complete()
+        display.refresh()

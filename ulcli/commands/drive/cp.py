@@ -52,7 +52,7 @@ from ulsdk.api.drive import (
     unlink,
 )
 
-from .progress import Progress
+from .progress import Progress, printable
 from .utils import parse_timestamp_arg, timestamp_in_range, is_directory_entry_id
 
 CHUNK_SIZE = 96 * 1024 * 1024
@@ -425,7 +425,11 @@ class LocalEntry(Entry):
             # Open only a device. A pipe can end when a writer closes it.
             if not stat.S_ISCHR(os.stat(self._path).st_mode):
                 return False
-            fd = os.open(self._path, os.O_WRONLY)
+            # Do not wait for the device or make it the process terminal.
+            flags = (
+                os.O_WRONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0)
+            )
+            fd = os.open(self._path, flags)
         except OSError:
             return False
         try:
@@ -529,7 +533,7 @@ def parse_files(context: RequestContext, files: List[str]) -> List[ResolvedArg]:
                 raise Exception("destination path does not exist; make it")
 
             if len(slots) == 0:
-                logger.warning(f"Source {files[i]} matched nothing")
+                logger.warning(f"Source {printable(files[i])} matched nothing")
 
             resolved_args.append(
                 ResolvedArg([DriveEntry(context, entry) for entry in slots], wildcard)
@@ -544,7 +548,7 @@ def parse_files(context: RequestContext, files: List[str]) -> List[ResolvedArg]:
                 globs = [file]
 
             if len(globs) == 0:
-                logger.warning(f"Source {files[i]} matched nothing")
+                logger.warning(f"Source {printable(files[i])} matched nothing")
 
             resolved_args.append(
                 ResolvedArg([LocalEntry(path) for path in globs], wildcard)
@@ -570,12 +574,12 @@ def is_download(transfer: Transfer) -> bool:
 
 
 def copy_file(transfer: Transfer, cancel: threading.Event, progress: Progress) -> None:
-    """Copy one file. Check for cancellation before and after each read.
+    """Copy one file. Stop on cancellation before or after each read.
 
     Count the bytes of a download in `progress`."""
     source, dest = transfer
     with progress.hidden():
-        logger.info(f"Copying {source.name()}")
+        logger.info(f"Copying {printable(source.name())}")
 
     def check_cancelled() -> None:
         if cancel.is_set():
@@ -596,6 +600,8 @@ def copy_file(transfer: Transfer, cancel: threading.Event, progress: Progress) -
     # Close the source after success, failure, or cancellation.
     with contextlib.closing(blocks):
         dest.put(copy_blocks(), source.size(), source.name())
+    if is_download(transfer):
+        progress.complete()
 
 
 def plan_directory_copy(source: Entry, dest: Entry, transfers: List[Transfer]) -> None:
@@ -675,7 +681,9 @@ def run_transfers(transfers: Sequence[Transfer], jobs: int, progress: Progress) 
                         failures.append(error)
                     with progress.hidden():
                         logger.error(
-                            f"Failed to copy {transfer.source.name()}: {error}"
+                            printable(
+                                f"Failed to copy {transfer.source.name()}: {error}"
+                            )
                         )
                     return
                 with lock:
@@ -752,8 +760,8 @@ The command reads each file in blocks to limit memory use. Use -j to set the
 number of files to copy at the same time. Use -j 1 to copy files one at a time.
 Copies to the same destination file run in the given order.
 
-On a terminal, the command shows the progress of each active download and the
-total of all downloads. Uploads and copies to a terminal show no progress.
+The terminal shows progress for each download and for all downloads together.
+The command shows no progress for uploads or for copies to a terminal.
 
 The command writes each local file to a temporary file before it replaces the
 destination. A failed copy leaves the previous file intact. Devices and pipes
@@ -865,7 +873,7 @@ You can delete these incomplete files after the command stops.
         for src in sources:
             if src.isdir():
                 logger.warning(
-                    f"Skipped directory {src.name()}. Use -r to copy its contents."
+                    f"Skipped directory {printable(src.name())}. Use -r to copy its contents."
                 )
                 continue
             if not timestamp_in_range(src.time(), earliest, latest):
@@ -873,7 +881,7 @@ You can delete these incomplete files after the command stops.
             transfers.append(Transfer(src, dest))
 
     sizes = [transfer.source.size() for transfer in transfers if is_download(transfer)]
-    if isinstance(dest, LocalEntry) and dest.isatty():
+    if sizes and isinstance(dest, LocalEntry) and dest.isatty():
         # The copy writes the files to the terminal. Do not mix progress with them.
         sizes = []
     progress = Progress(sys.stderr, len(sizes), sum(sizes))
