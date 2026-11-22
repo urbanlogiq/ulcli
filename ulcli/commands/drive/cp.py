@@ -4,23 +4,25 @@ import argparse
 import contextlib
 import errno
 import glob
+import hashlib
 import os
 import os.path
+import re
 import signal
 import stat
 import sys
-import threading
 import tempfile
+import threading
+import time
+import traceback
 import unicodedata
 import urllib.parse
 import uuid
-import hashlib
-import time
-import magic
 from abc import ABC, abstractmethod
 from collections import deque
 from types import FrameType
 from typing import (
+    BinaryIO,
     Dict,
     Generator,
     Hashable,
@@ -33,27 +35,39 @@ from typing import (
     Sequence,
     Set,
 )
-from requests import HTTPError
-from loguru import logger
 
-import ulcli.argparser
-from ulcli.commands.common import get_api_context
-from ulcli.commands.common import uuid_from_id
+import magic
+import requests
+from loguru import logger
+from requests import HTTPError
 from ulsdk.api.datacatalog import get_object
-from ulsdk.types.id import ObjectId
-from ulsdk.types.fs import ListSlot, DirectoryEntry, ListDirectory, TopLevelDirectory
-from ulsdk.request_context import RequestContext
 from ulsdk.api.drive import (
-    ls,
-    get_roots,
     create_entry,
     get_file_stream,
+    get_roots,
+    ls,
     put_file_chunk,
     unlink,
 )
+from ulsdk.request_context import RequestContext, ResponseStream
+from ulsdk.types.fs import (
+    DirectoryEntry,
+    File,
+    ListDirectory,
+    ListSlot,
+    TopLevelDirectory,
+)
+from ulsdk.types.id import ObjectId
+
+import ulcli.argparser
+from ulcli.commands.common import get_api_context, uuid_from_id
 
 from .progress import Progress, printable
-from .utils import parse_timestamp_arg, timestamp_in_range, is_directory_entry_id
+from .utils import (
+    is_directory_entry_id,
+    parse_timestamp_arg,
+    timestamp_in_range,
+)
 
 CHUNK_SIZE = 96 * 1024 * 1024
 CHUNK_UPLOAD_ATTEMPTS = 10
@@ -64,6 +78,19 @@ PARTIAL_SUFFIX = ".ulpart"
 PARTIAL_NAME_LENGTH = 48
 INTERRUPT_GRACE_SECONDS = 2.0
 DOWNLOAD_TIMEOUT = (10, 60)
+# Stop after this many failures without new content.
+DOWNLOAD_ATTEMPTS = 6
+# Double the wait after each failure without new content.
+DOWNLOAD_RETRY_SECONDS = 1.0
+# The connection failed or the response ended early.
+DOWNLOAD_RETRY_ERRORS = (
+    requests.ConnectionError,
+    requests.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.ContentDecodingError,
+)
+# Try again after these temporary server errors.
+DOWNLOAD_RETRY_STATUSES = (502, 503, 504)
 
 # A root directory has this id as its parent.
 NIL_UUID = uuid.UUID(int=0)
@@ -200,20 +227,143 @@ def put_file(
         chunk = next(chunks, b"")
 
 
+def incomplete_upload(context: RequestContext, id: uuid.UUID) -> Optional[str]:
+    """Describe a file whose upload did not complete. Return None for a
+    complete file, or if the drive does not give the entry."""
+    try:
+        obj = get_object(context, ObjectId.from_uuid(id))
+        file = DirectoryEntry.from_bytes(bytes(obj.obj)).entry.value
+        chunks = (file.chunks or []) if isinstance(file, File) else []
+        stored = sum(1 for chunk in chunks if chunk.size > 0)
+    except Exception:
+        return None
+    if stored == len(chunks):
+        return None
+    return (
+        "The upload of this file did not complete."
+        f" The drive has {stored} of {len(chunks)} blocks."
+    )
+
+
+def file_version_tag(file: BinaryIO) -> Optional[str]:
+    """Return the file version tag if later requests can use it."""
+    if not isinstance(file, ResponseStream):
+        return None
+    # Byte ranges count compressed bytes. The reader returns decoded bytes.
+    if file.headers.get("Content-Encoding", "identity").lower() != "identity":
+        return None
+    tag = file.headers.get("ETag", "")
+    # If-Range needs a quoted tag without the W/ prefix.
+    return tag if re.fullmatch(r'"[\x21\x23-\x7e\x80-\xff]*"', tag) else None
+
+
+def open_drive_file(
+    context: RequestContext,
+    id: uuid.UUID,
+    start: int,
+    tag: Optional[str],
+    length: Optional[int] = None,
+) -> BinaryIO:
+    """Request a drive file from byte `start`. Check the file version and
+    byte range before the copy continues."""
+    if start > 0 and tag is None:
+        raise OSError("Cannot continue a download without a file version tag.")
+    stream = get_file_stream(
+        context,
+        ObjectId.from_uuid(id),
+        byte_range=f"bytes={start}-" if start else None,
+        if_range=tag if start else None,
+        timeout=DOWNLOAD_TIMEOUT,
+        allow_redirects=False,
+    )
+    if start == 0:
+        return stream
+
+    try:
+        if not isinstance(stream, ResponseStream) or stream.status_code != 206:
+            raise OSError("File changed during the copy.")
+        if file_version_tag(stream) != tag:
+            raise OSError("File changed during the copy.")
+        match = re.fullmatch(
+            rf"bytes {start}-([0-9]+)/([0-9]+)",
+            stream.headers.get("Content-Range", ""),
+        )
+        if match is None:
+            raise OSError("The response has an invalid byte range.")
+        end, total = map(int, match.groups())
+        if end < start or end >= total or (length is not None and total != length):
+            raise OSError("The response has an invalid byte range.")
+    except BaseException:
+        stream.close()
+        raise
+    return stream
+
+
 def read_drive_file(
     context: RequestContext, id: uuid.UUID, block_size: int
 ) -> Generator[bytes, None, None]:
-    """Read a drive file in blocks of at most `block_size` bytes."""
+    """Read a drive file in blocks of at most `block_size` bytes.
+
+    Request the remaining bytes only when the file version can be checked.
+    Stop after `DOWNLOAD_ATTEMPTS` failures without new content.
+    """
     if block_size < 1:
         raise ValueError("Block size must be at least 1")
     size = min(block_size, BLOCK_SIZE)
-    with get_file_stream(
-        context,
-        ObjectId.from_uuid(id),
-        timeout=DOWNLOAD_TIMEOUT,
-        allow_redirects=False,
-    ) as file:
-        yield from iter(lambda: file.read(size), b"")
+    received = 0
+    tag: Optional[str] = None
+    length: Optional[int] = None
+    failures = 0
+    while True:
+        try:
+            with open_drive_file(context, id, received, tag, length) as file:
+                if received == 0:
+                    tag = file_version_tag(file)
+                    length = None
+                    if tag is not None and isinstance(file, ResponseStream):
+                        declared = file.headers.get("Content-Length", "")
+                        length = (
+                            int(declared) if re.fullmatch(r"[0-9]+", declared) else None
+                        )
+                blocks = iter(lambda: file.read(size), b"")
+                total = length
+                if received > 0 and isinstance(file, ResponseStream):
+                    end, total = map(
+                        int,
+                        file.headers["Content-Range"].split("-", 1)[1].split("/"),
+                    )
+                    blocks = check_size(blocks, end - received + 1)
+                for block in blocks:
+                    received += len(block)
+                    failures = 0
+                    yield block
+                    # Release this block before the next read.
+                    del block
+            if total is None or received == total:
+                return
+            if received > total:
+                raise OSError("File size changed during the copy.")
+            # A response can contain only part of the requested bytes.
+            length = total
+            continue
+        except DOWNLOAD_RETRY_ERRORS as error:
+            failure: Exception = error
+        except HTTPError as error:
+            status = None if error.response is None else error.response.status_code
+            if status == 404:
+                # The drive gives this status for a file without all its blocks.
+                reason = incomplete_upload(context, id)
+                if reason is not None:
+                    raise OSError(reason) from error
+            if status not in DOWNLOAD_RETRY_STATUSES:
+                raise
+            failure = error
+
+        failures += 1
+        # Without a tag, a new request cannot detect a file that changed.
+        if failures == DOWNLOAD_ATTEMPTS or (received > 0 and tag is None):
+            raise failure
+        time.sleep(DOWNLOAD_RETRY_SECONDS * 2 ** (failures - 1))
 
 
 # Track temporary files for removal after cancellation.
@@ -272,7 +422,9 @@ def write_complete_file(path: str, blocks: Iterable[bytes]) -> None:
 
     directory, name = os.path.split(path)
     fd, partial = tempfile.mkstemp(
-        dir=directory, prefix=f".{name[:PARTIAL_NAME_LENGTH]}.", suffix=PARTIAL_SUFFIX
+        dir=directory,
+        prefix=f".{name[:PARTIAL_NAME_LENGTH]}.",
+        suffix=PARTIAL_SUFFIX,
     )
     try:
         with os.fdopen(fd, "wb") as f:
@@ -642,25 +794,41 @@ def join_all(threads: Sequence[threading.Thread], timeout: Optional[float]) -> N
 def run_transfers(transfers: Sequence[Transfer], jobs: int, progress: Progress) -> None:
     """Copy at most `jobs` files at a time.
 
-    Stop new copies after a failure. Wait for active copies, then report the
-    failure."""
+    A file that fails does not stop the other files. Report each failure.
+    After all copies end, raise the first failure."""
     groups = deque(group_by_target(transfers))
     num_workers = min(jobs, len(groups))
 
-    if num_workers <= 1:
-        # Use the calling thread so that Ctrl-C stops a single copy directly.
-        never = threading.Event()
-        for transfer in transfers:
-            copy_file(transfer, never, progress)
-        return
-
     cancel = threading.Event()
     lock = threading.Lock()
-    failures: List[BaseException] = []
+    first_failure: Optional[Exception] = None
+    failed = 0
+    # An error that is not the failure of one file stops new copies.
+    fatal: List[BaseException] = []
     copied = 0
 
+    def copy(transfer: Transfer) -> None:
+        nonlocal copied, failed, first_failure
+        try:
+            copy_file(transfer, cancel, progress)
+        except Cancelled:
+            raise
+        except Exception as error:
+            # Release file data held by functions that failed.
+            traceback.clear_frames(error.__traceback__)
+            with lock:
+                failed += 1
+                if first_failure is None:
+                    first_failure = error
+            with progress.hidden():
+                logger.error(
+                    printable(f"Failed to copy {transfer.source.name()}: {error}")
+                )
+            return
+        with lock:
+            copied += 1
+
     def work() -> None:
-        nonlocal copied
         while True:
             with lock:
                 if not groups:
@@ -668,48 +836,47 @@ def run_transfers(transfers: Sequence[Transfer], jobs: int, progress: Progress) 
                 group = groups.popleft()
 
             for transfer in group:
-                # Do not start another copy after a failure or cancellation.
-                if failures or cancel.is_set():
+                # Stop new copies after cancellation or an error outside one file.
+                if fatal or cancel.is_set():
                     return
                 try:
-                    copy_file(transfer, cancel, progress)
+                    copy(transfer)
                 except Cancelled:
                     return
                 except BaseException as error:
-                    # Report failures that would otherwise end only this thread.
+                    # Report errors that would otherwise end only this thread.
                     with lock:
-                        failures.append(error)
-                    with progress.hidden():
-                        logger.error(
-                            printable(
-                                f"Failed to copy {transfer.source.name()}: {error}"
-                            )
-                        )
+                        fatal.append(error)
                     return
-                with lock:
-                    copied += 1
 
-    # Let the command exit if a network request cannot stop.
-    threads = [threading.Thread(target=work, daemon=True) for _ in range(num_workers)]
-    try:
-        for thread in threads:
-            thread.start()
-        join_all(threads, None)
-    except BaseException:
-        # Stop active copies, then remove any remaining temporary files.
-        cancel.set()
+    if num_workers <= 1:
+        # Use the calling thread so that Ctrl-C stops a single copy directly.
+        for transfer in transfers:
+            copy(transfer)
+    else:
+        # Let the command exit if a network request cannot stop.
+        threads = [
+            threading.Thread(target=work, daemon=True) for _ in range(num_workers)
+        ]
         try:
-            join_all(threads, INTERRUPT_GRACE_SECONDS)
-        finally:
-            remove_partial_files()
-        raise
+            for thread in threads:
+                thread.start()
+            join_all(threads, None)
+        except BaseException:
+            # Stop active copies, then remove any remaining temporary files.
+            cancel.set()
+            try:
+                join_all(threads, INTERRUPT_GRACE_SECONDS)
+            finally:
+                remove_partial_files()
+            raise
 
-    if failures:
+    if fatal:
+        raise fatal[0]
+    if first_failure is not None:
         with progress.hidden():
-            logger.error(
-                f"Copied {copied} of {len(transfers)} files and stopped after a failure"
-            )
-        raise failures[0]
+            logger.error(f"Copied {copied} of {len(transfers)} files. {failed} failed.")
+        raise first_failure
 
 
 @contextlib.contextmanager
@@ -768,6 +935,10 @@ destination. A failed copy leaves the previous file intact. Devices and pipes
 receive content directly. Only the owner can read or write a new local file.
 Existing files keep their access permissions. Copies remove special execution
 permissions. Names from the drive cannot point outside the destination directory.
+
+The command can continue an interrupted download if the server identifies the
+file version and sends uncompressed content. A file that fails does not stop the
+other files. The command reports each failure and then ends with an error.
 
 A forced exit can leave a hidden file named `.<name>.<random>.ulpart`.
 You can delete these incomplete files after the command stops.
