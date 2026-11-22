@@ -141,6 +141,13 @@ def source_tree() -> FakeEntry:
     return root
 
 
+@pytest.fixture(autouse=True)
+def no_retry_wait(monkeypatch: pytest.MonkeyPatch):
+    """Do not wait between the requests of one download."""
+
+    monkeypatch.setattr(cp, "DOWNLOAD_RETRY_SECONDS", 0.0)
+
+
 def no_progress() -> Progress:
     """Return a progress display that shows nothing."""
 

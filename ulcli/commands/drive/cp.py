@@ -21,6 +21,7 @@ from abc import ABC, abstractmethod
 from collections import deque
 from types import FrameType
 from typing import (
+    BinaryIO,
     Dict,
     Generator,
     Hashable,
@@ -33,6 +34,7 @@ from typing import (
     Sequence,
     Set,
 )
+import requests
 from requests import HTTPError
 from loguru import logger
 
@@ -42,7 +44,7 @@ from ulcli.commands.common import uuid_from_id
 from ulsdk.api.datacatalog import get_object
 from ulsdk.types.id import ObjectId
 from ulsdk.types.fs import ListSlot, DirectoryEntry, ListDirectory, TopLevelDirectory
-from ulsdk.request_context import RequestContext
+from ulsdk.request_context import RequestContext, ResponseStream
 from ulsdk.api.drive import (
     ls,
     get_roots,
@@ -64,6 +66,20 @@ PARTIAL_SUFFIX = ".ulpart"
 PARTIAL_NAME_LENGTH = 48
 INTERRUPT_GRACE_SECONDS = 2.0
 DOWNLOAD_TIMEOUT = (10, 60)
+# Stop a download after this many failures in a row with no content between them.
+DOWNLOAD_ATTEMPTS = 6
+# Wait this long after a failure. Each wait with no content between them is two
+# times longer.
+DOWNLOAD_RETRY_SECONDS = 1.0
+# The connection failed or the response ended early.
+DOWNLOAD_RETRY_ERRORS = (
+    requests.ConnectionError,
+    requests.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.ContentDecodingError,
+)
+# The gateway gives these statuses while the drive service is not available.
+DOWNLOAD_RETRY_STATUSES = (502, 503, 504)
 
 # A root directory has this id as its parent.
 NIL_UUID = uuid.UUID(int=0)
@@ -200,20 +216,85 @@ def put_file(
         chunk = next(chunks, b"")
 
 
+def entity_tag(file: BinaryIO) -> Optional[str]:
+    """Return the tag that identifies this version of the file. A later
+    request can use only a strong tag."""
+    if not isinstance(file, ResponseStream):
+        return None
+    tag = file.headers.get("ETag")
+    return None if tag is None or tag.startswith("W/") else tag
+
+
+def open_drive_file(
+    context: RequestContext, id: uuid.UUID, start: int, tag: Optional[str]
+) -> BinaryIO:
+    """Request a drive file from byte `start`. A start after byte 0 needs
+    the `tag` of the first response. Fail if the file changed after it."""
+    file = ObjectId.from_uuid(id)
+    if start == 0:
+        return get_file_stream(
+            context, file, timeout=DOWNLOAD_TIMEOUT, allow_redirects=False
+        )
+
+    stream = get_file_stream(
+        context,
+        file,
+        f"bytes={start}-",
+        tag,
+        timeout=DOWNLOAD_TIMEOUT,
+        allow_redirects=False,
+    )
+    # The drive sends the complete file if the file changed.
+    if (
+        not isinstance(stream, ResponseStream)
+        or stream.status_code != 206
+        or not stream.headers.get("Content-Range", "").startswith(f"bytes {start}-")
+    ):
+        stream.close()
+        raise OSError("File changed during the copy.")
+    return stream
+
+
 def read_drive_file(
     context: RequestContext, id: uuid.UUID, block_size: int
 ) -> Generator[bytes, None, None]:
-    """Read a drive file in blocks of at most `block_size` bytes."""
+    """Read a drive file in blocks of at most `block_size` bytes.
+
+    If a request fails or its response ends early, request the remaining
+    bytes. Stop after `DOWNLOAD_ATTEMPTS` failures in a row with no content
+    between them.
+    """
     if block_size < 1:
         raise ValueError("Block size must be at least 1")
     size = min(block_size, BLOCK_SIZE)
-    with get_file_stream(
-        context,
-        ObjectId.from_uuid(id),
-        timeout=DOWNLOAD_TIMEOUT,
-        allow_redirects=False,
-    ) as file:
-        yield from iter(lambda: file.read(size), b"")
+    received = 0
+    tag: Optional[str] = None
+    failures = 0
+    while True:
+        try:
+            with open_drive_file(context, id, received, tag) as file:
+                if received == 0:
+                    tag = entity_tag(file)
+                for block in iter(lambda: file.read(size), b""):
+                    received += len(block)
+                    failures = 0
+                    yield block
+                    # Release this block before the next read.
+                    del block
+            return
+        except DOWNLOAD_RETRY_ERRORS as error:
+            failure: Exception = error
+        except HTTPError as error:
+            status = None if error.response is None else error.response.status_code
+            if status not in DOWNLOAD_RETRY_STATUSES:
+                raise
+            failure = error
+
+        failures += 1
+        # Without a tag, a new request cannot detect a file that changed.
+        if failures == DOWNLOAD_ATTEMPTS or (received > 0 and tag is None):
+            raise failure
+        time.sleep(DOWNLOAD_RETRY_SECONDS * 2 ** (failures - 1))
 
 
 # Track temporary files for removal after cancellation.
@@ -768,6 +849,9 @@ destination. A failed copy leaves the previous file intact. Devices and pipes
 receive content directly. Only the owner can read or write a new local file.
 Existing files keep their access permissions. Copies remove special execution
 permissions. Names from the drive cannot point outside the destination directory.
+
+If a download stops before the end of the file, the command requests the
+remaining content.
 
 A forced exit can leave a hidden file named `.<name>.<random>.ulpart`.
 You can delete these incomplete files after the command stops.
