@@ -4,19 +4,20 @@ import argparse
 import contextlib
 import errno
 import glob
+import hashlib
 import os
 import os.path
+import re
 import signal
 import stat
 import sys
-import threading
 import tempfile
+import threading
+import time
+import traceback
 import unicodedata
 import urllib.parse
 import uuid
-import hashlib
-import time
-import magic
 from abc import ABC, abstractmethod
 from collections import deque
 from types import FrameType
@@ -34,15 +35,21 @@ from typing import (
     Sequence,
     Set,
 )
-import requests
-from requests import HTTPError
-from loguru import logger
 
-import ulcli.argparser
-from ulcli.commands.common import get_api_context
-from ulcli.commands.common import uuid_from_id
+import magic
+import requests
+from loguru import logger
+from requests import HTTPError
 from ulsdk.api.datacatalog import get_object
-from ulsdk.types.id import ObjectId
+from ulsdk.api.drive import (
+    create_entry,
+    get_file_stream,
+    get_roots,
+    ls,
+    put_file_chunk,
+    unlink,
+)
+from ulsdk.request_context import RequestContext, ResponseStream
 from ulsdk.types.fs import (
     DirectoryEntry,
     File,
@@ -50,18 +57,17 @@ from ulsdk.types.fs import (
     ListSlot,
     TopLevelDirectory,
 )
-from ulsdk.request_context import RequestContext, ResponseStream
-from ulsdk.api.drive import (
-    ls,
-    get_roots,
-    create_entry,
-    get_file_stream,
-    put_file_chunk,
-    unlink,
-)
+from ulsdk.types.id import ObjectId
+
+import ulcli.argparser
+from ulcli.commands.common import get_api_context, uuid_from_id
 
 from .progress import Progress, printable
-from .utils import parse_timestamp_arg, timestamp_in_range, is_directory_entry_id
+from .utils import (
+    is_directory_entry_id,
+    parse_timestamp_arg,
+    timestamp_in_range,
+)
 
 CHUNK_SIZE = 96 * 1024 * 1024
 CHUNK_UPLOAD_ATTEMPTS = 10
@@ -72,10 +78,9 @@ PARTIAL_SUFFIX = ".ulpart"
 PARTIAL_NAME_LENGTH = 48
 INTERRUPT_GRACE_SECONDS = 2.0
 DOWNLOAD_TIMEOUT = (10, 60)
-# Stop a download after this many failures in a row with no content between them.
+# Stop after this many failures without new content.
 DOWNLOAD_ATTEMPTS = 6
-# Wait this long after a failure. Each wait with no content between them is two
-# times longer.
+# Double the wait after each failure without new content.
 DOWNLOAD_RETRY_SECONDS = 1.0
 # The connection failed or the response ended early.
 DOWNLOAD_RETRY_ERRORS = (
@@ -84,7 +89,7 @@ DOWNLOAD_RETRY_ERRORS = (
     requests.exceptions.ChunkedEncodingError,
     requests.exceptions.ContentDecodingError,
 )
-# The gateway gives these statuses while the drive service is not available.
+# Try again after these temporary server errors.
 DOWNLOAD_RETRY_STATUSES = (502, 503, 504)
 
 # A root directory has this id as its parent.
@@ -240,42 +245,57 @@ def incomplete_upload(context: RequestContext, id: uuid.UUID) -> Optional[str]:
     )
 
 
-def entity_tag(file: BinaryIO) -> Optional[str]:
-    """Return the tag that identifies this version of the file. A later
-    request can use only a strong tag."""
+def file_version_tag(file: BinaryIO) -> Optional[str]:
+    """Return the file version tag if later requests can use it."""
     if not isinstance(file, ResponseStream):
         return None
-    tag = file.headers.get("ETag")
-    return None if tag is None or tag.startswith("W/") else tag
+    # Byte ranges count compressed bytes. The reader returns decoded bytes.
+    if file.headers.get("Content-Encoding", "identity").lower() != "identity":
+        return None
+    tag = file.headers.get("ETag", "")
+    # If-Range needs a quoted tag without the W/ prefix.
+    return tag if re.fullmatch(r'"[\x21\x23-\x7e\x80-\xff]*"', tag) else None
 
 
 def open_drive_file(
-    context: RequestContext, id: uuid.UUID, start: int, tag: Optional[str]
+    context: RequestContext,
+    id: uuid.UUID,
+    start: int,
+    tag: Optional[str],
+    length: Optional[int] = None,
 ) -> BinaryIO:
-    """Request a drive file from byte `start`. A start after byte 0 needs
-    the `tag` of the first response. Fail if the file changed after it."""
-    file = ObjectId.from_uuid(id)
-    if start == 0:
-        return get_file_stream(
-            context, file, timeout=DOWNLOAD_TIMEOUT, allow_redirects=False
-        )
-
+    """Request a drive file from byte `start`. Check the file version and
+    byte range before the copy continues."""
+    if start > 0 and tag is None:
+        raise OSError("Cannot continue a download without a file version tag.")
     stream = get_file_stream(
         context,
-        file,
-        f"bytes={start}-",
-        tag,
+        ObjectId.from_uuid(id),
+        byte_range=f"bytes={start}-" if start else None,
+        if_range=tag if start else None,
         timeout=DOWNLOAD_TIMEOUT,
         allow_redirects=False,
     )
-    # The drive sends the complete file if the file changed.
-    if (
-        not isinstance(stream, ResponseStream)
-        or stream.status_code != 206
-        or not stream.headers.get("Content-Range", "").startswith(f"bytes {start}-")
-    ):
+    if start == 0:
+        return stream
+
+    try:
+        if not isinstance(stream, ResponseStream) or stream.status_code != 206:
+            raise OSError("File changed during the copy.")
+        if file_version_tag(stream) != tag:
+            raise OSError("File changed during the copy.")
+        match = re.fullmatch(
+            rf"bytes {start}-([0-9]+)/([0-9]+)",
+            stream.headers.get("Content-Range", ""),
+        )
+        if match is None:
+            raise OSError("The response has an invalid byte range.")
+        end, total = map(int, match.groups())
+        if end < start or end >= total or (length is not None and total != length):
+            raise OSError("The response has an invalid byte range.")
+    except BaseException:
         stream.close()
-        raise OSError("File changed during the copy.")
+        raise
     return stream
 
 
@@ -284,28 +304,48 @@ def read_drive_file(
 ) -> Generator[bytes, None, None]:
     """Read a drive file in blocks of at most `block_size` bytes.
 
-    If a request fails or its response ends early, request the remaining
-    bytes. Stop after `DOWNLOAD_ATTEMPTS` failures in a row with no content
-    between them.
+    Request the remaining bytes only when the file version can be checked.
+    Stop after `DOWNLOAD_ATTEMPTS` failures without new content.
     """
     if block_size < 1:
         raise ValueError("Block size must be at least 1")
     size = min(block_size, BLOCK_SIZE)
     received = 0
     tag: Optional[str] = None
+    length: Optional[int] = None
     failures = 0
     while True:
         try:
-            with open_drive_file(context, id, received, tag) as file:
+            with open_drive_file(context, id, received, tag, length) as file:
                 if received == 0:
-                    tag = entity_tag(file)
-                for block in iter(lambda: file.read(size), b""):
+                    tag = file_version_tag(file)
+                    length = None
+                    if tag is not None and isinstance(file, ResponseStream):
+                        declared = file.headers.get("Content-Length", "")
+                        length = (
+                            int(declared) if re.fullmatch(r"[0-9]+", declared) else None
+                        )
+                blocks = iter(lambda: file.read(size), b"")
+                total = length
+                if received > 0 and isinstance(file, ResponseStream):
+                    end, total = map(
+                        int,
+                        file.headers["Content-Range"].split("-", 1)[1].split("/"),
+                    )
+                    blocks = check_size(blocks, end - received + 1)
+                for block in blocks:
                     received += len(block)
                     failures = 0
                     yield block
                     # Release this block before the next read.
                     del block
-            return
+            if total is None or received == total:
+                return
+            if received > total:
+                raise OSError("File size changed during the copy.")
+            # A response can contain only part of the requested bytes.
+            length = total
+            continue
         except DOWNLOAD_RETRY_ERRORS as error:
             failure: Exception = error
         except HTTPError as error:
@@ -382,7 +422,9 @@ def write_complete_file(path: str, blocks: Iterable[bytes]) -> None:
 
     directory, name = os.path.split(path)
     fd, partial = tempfile.mkstemp(
-        dir=directory, prefix=f".{name[:PARTIAL_NAME_LENGTH]}.", suffix=PARTIAL_SUFFIX
+        dir=directory,
+        prefix=f".{name[:PARTIAL_NAME_LENGTH]}.",
+        suffix=PARTIAL_SUFFIX,
     )
     try:
         with os.fdopen(fd, "wb") as f:
@@ -759,20 +801,25 @@ def run_transfers(transfers: Sequence[Transfer], jobs: int, progress: Progress) 
 
     cancel = threading.Event()
     lock = threading.Lock()
-    failures: List[Exception] = []
+    first_failure: Optional[Exception] = None
+    failed = 0
     # An error that is not the failure of one file stops new copies.
     fatal: List[BaseException] = []
     copied = 0
 
     def copy(transfer: Transfer) -> None:
-        nonlocal copied
+        nonlocal copied, failed, first_failure
         try:
             copy_file(transfer, cancel, progress)
         except Cancelled:
             raise
         except Exception as error:
+            # Release file data held by functions that failed.
+            traceback.clear_frames(error.__traceback__)
             with lock:
-                failures.append(error)
+                failed += 1
+                if first_failure is None:
+                    first_failure = error
             with progress.hidden():
                 logger.error(
                     printable(f"Failed to copy {transfer.source.name()}: {error}")
@@ -789,7 +836,7 @@ def run_transfers(transfers: Sequence[Transfer], jobs: int, progress: Progress) 
                 group = groups.popleft()
 
             for transfer in group:
-                # Do not start another copy after such an error or cancellation.
+                # Stop new copies after cancellation or an error outside one file.
                 if fatal or cancel.is_set():
                     return
                 try:
@@ -826,12 +873,10 @@ def run_transfers(transfers: Sequence[Transfer], jobs: int, progress: Progress) 
 
     if fatal:
         raise fatal[0]
-    if failures:
+    if first_failure is not None:
         with progress.hidden():
-            logger.error(
-                f"Copied {copied} of {len(transfers)} files. {len(failures)} failed."
-            )
-        raise failures[0]
+            logger.error(f"Copied {copied} of {len(transfers)} files. {failed} failed.")
+        raise first_failure
 
 
 @contextlib.contextmanager
@@ -891,9 +936,9 @@ receive content directly. Only the owner can read or write a new local file.
 Existing files keep their access permissions. Copies remove special execution
 permissions. Names from the drive cannot point outside the destination directory.
 
-If a download stops before the end of the file, the command requests the
-remaining content. A file that fails does not stop the other files. The command
-reports each failure and then ends with an error.
+The command can continue an interrupted download if the server identifies the
+file version and sends uncompressed content. A file that fails does not stop the
+other files. The command reports each failure and then ends with an error.
 
 A forced exit can leave a hidden file named `.<name>.<random>.ulpart`.
 You can delete these incomplete files after the command stops.
