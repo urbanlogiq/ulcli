@@ -43,7 +43,13 @@ from ulcli.commands.common import get_api_context
 from ulcli.commands.common import uuid_from_id
 from ulsdk.api.datacatalog import get_object
 from ulsdk.types.id import ObjectId
-from ulsdk.types.fs import ListSlot, DirectoryEntry, ListDirectory, TopLevelDirectory
+from ulsdk.types.fs import (
+    DirectoryEntry,
+    File,
+    ListDirectory,
+    ListSlot,
+    TopLevelDirectory,
+)
 from ulsdk.request_context import RequestContext, ResponseStream
 from ulsdk.api.drive import (
     ls,
@@ -216,6 +222,24 @@ def put_file(
         chunk = next(chunks, b"")
 
 
+def incomplete_upload(context: RequestContext, id: uuid.UUID) -> Optional[str]:
+    """Describe a file whose upload did not complete. Return None for a
+    complete file, or if the drive does not give the entry."""
+    try:
+        obj = get_object(context, ObjectId.from_uuid(id))
+        file = DirectoryEntry.from_bytes(bytes(obj.obj)).entry.value
+        chunks = (file.chunks or []) if isinstance(file, File) else []
+        stored = sum(1 for chunk in chunks if chunk.size > 0)
+    except Exception:
+        return None
+    if stored == len(chunks):
+        return None
+    return (
+        "The upload of this file did not complete."
+        f" The drive has {stored} of {len(chunks)} blocks."
+    )
+
+
 def entity_tag(file: BinaryIO) -> Optional[str]:
     """Return the tag that identifies this version of the file. A later
     request can use only a strong tag."""
@@ -286,6 +310,11 @@ def read_drive_file(
             failure: Exception = error
         except HTTPError as error:
             status = None if error.response is None else error.response.status_code
+            if status == 404:
+                # The drive gives this status for a file without all its blocks.
+                reason = incomplete_upload(context, id)
+                if reason is not None:
+                    raise OSError(reason) from error
             if status not in DOWNLOAD_RETRY_STATUSES:
                 raise
             failure = error
