@@ -752,25 +752,36 @@ def join_all(threads: Sequence[threading.Thread], timeout: Optional[float]) -> N
 def run_transfers(transfers: Sequence[Transfer], jobs: int, progress: Progress) -> None:
     """Copy at most `jobs` files at a time.
 
-    Stop new copies after a failure. Wait for active copies, then report the
-    failure."""
+    A file that fails does not stop the other files. Report each failure.
+    After all copies end, raise the first failure."""
     groups = deque(group_by_target(transfers))
     num_workers = min(jobs, len(groups))
 
-    if num_workers <= 1:
-        # Use the calling thread so that Ctrl-C stops a single copy directly.
-        never = threading.Event()
-        for transfer in transfers:
-            copy_file(transfer, never, progress)
-        return
-
     cancel = threading.Event()
     lock = threading.Lock()
-    failures: List[BaseException] = []
+    failures: List[Exception] = []
+    # An error that is not the failure of one file stops new copies.
+    fatal: List[BaseException] = []
     copied = 0
 
-    def work() -> None:
+    def copy(transfer: Transfer) -> None:
         nonlocal copied
+        try:
+            copy_file(transfer, cancel, progress)
+        except Cancelled:
+            raise
+        except Exception as error:
+            with lock:
+                failures.append(error)
+            with progress.hidden():
+                logger.error(
+                    printable(f"Failed to copy {transfer.source.name()}: {error}")
+                )
+            return
+        with lock:
+            copied += 1
+
+    def work() -> None:
         while True:
             with lock:
                 if not groups:
@@ -778,46 +789,47 @@ def run_transfers(transfers: Sequence[Transfer], jobs: int, progress: Progress) 
                 group = groups.popleft()
 
             for transfer in group:
-                # Do not start another copy after a failure or cancellation.
-                if failures or cancel.is_set():
+                # Do not start another copy after such an error or cancellation.
+                if fatal or cancel.is_set():
                     return
                 try:
-                    copy_file(transfer, cancel, progress)
+                    copy(transfer)
                 except Cancelled:
                     return
                 except BaseException as error:
-                    # Report failures that would otherwise end only this thread.
+                    # Report errors that would otherwise end only this thread.
                     with lock:
-                        failures.append(error)
-                    with progress.hidden():
-                        logger.error(
-                            printable(
-                                f"Failed to copy {transfer.source.name()}: {error}"
-                            )
-                        )
+                        fatal.append(error)
                     return
-                with lock:
-                    copied += 1
 
-    # Let the command exit if a network request cannot stop.
-    threads = [threading.Thread(target=work, daemon=True) for _ in range(num_workers)]
-    try:
-        for thread in threads:
-            thread.start()
-        join_all(threads, None)
-    except BaseException:
-        # Stop active copies, then remove any remaining temporary files.
-        cancel.set()
+    if num_workers <= 1:
+        # Use the calling thread so that Ctrl-C stops a single copy directly.
+        for transfer in transfers:
+            copy(transfer)
+    else:
+        # Let the command exit if a network request cannot stop.
+        threads = [
+            threading.Thread(target=work, daemon=True) for _ in range(num_workers)
+        ]
         try:
-            join_all(threads, INTERRUPT_GRACE_SECONDS)
-        finally:
-            remove_partial_files()
-        raise
+            for thread in threads:
+                thread.start()
+            join_all(threads, None)
+        except BaseException:
+            # Stop active copies, then remove any remaining temporary files.
+            cancel.set()
+            try:
+                join_all(threads, INTERRUPT_GRACE_SECONDS)
+            finally:
+                remove_partial_files()
+            raise
 
+    if fatal:
+        raise fatal[0]
     if failures:
         with progress.hidden():
             logger.error(
-                f"Copied {copied} of {len(transfers)} files and stopped after a failure"
+                f"Copied {copied} of {len(transfers)} files. {len(failures)} failed."
             )
         raise failures[0]
 
@@ -880,7 +892,8 @@ Existing files keep their access permissions. Copies remove special execution
 permissions. Names from the drive cannot point outside the destination directory.
 
 If a download stops before the end of the file, the command requests the
-remaining content.
+remaining content. A file that fails does not stop the other files. The command
+reports each failure and then ends with an error.
 
 A forced exit can leave a hidden file named `.<name>.<random>.ulpart`.
 You can delete these incomplete files after the command stops.

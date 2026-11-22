@@ -148,6 +148,13 @@ def no_retry_wait(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(cp, "DOWNLOAD_RETRY_SECONDS", 0.0)
 
 
+@pytest.fixture(autouse=True)
+def no_retry_wait(monkeypatch: pytest.MonkeyPatch):
+    """Do not wait between the requests of one download."""
+
+    monkeypatch.setattr(cp, "DOWNLOAD_RETRY_SECONDS", 0.0)
+
+
 def no_progress() -> Progress:
     """Return a progress display that shows nothing."""
 
@@ -1680,7 +1687,7 @@ def log() -> Iterator[List[str]]:
     logger.remove(sink)
 
 
-def test_a_failure_stops_new_copies_and_lets_the_copies_active_copies_finish(
+def test_a_failure_does_not_stop_the_other_copies(
     monkeypatch: pytest.MonkeyPatch, log: List[str]
 ):
 
@@ -1714,10 +1721,14 @@ def test_a_failure_stops_new_copies_and_lets_the_copies_active_copies_finish(
     finally:
         logger.remove(sink)
 
-    assert flatten(dest) == {"slow.csv": b"slow"}
-    assert sorted(recorder.started()) == ["bad.csv", "slow.csv"]
+    assert flatten(dest) == {
+        "slow.csv": b"slow",
+        "late.csv": b"late",
+        "later.csv": b"later",
+    }
+    assert sorted(recorder.started()) == sorted(source.name() for source in sources)
     assert "Failed to copy bad.csv: the drive said no" in log
-    assert "Copied 1 of 4 files and stopped after a failure" in log
+    assert "Copied 3 of 4 files. 1 failed." in log
 
 
 def test_a_worker_that_dies_of_anything_fails_the_command(
@@ -1741,7 +1752,9 @@ def test_a_worker_that_dies_of_anything_fails_the_command(
         run_cp(monkeypatch, ["-j", "2", "folder/*", "dest"], resolved)
 
 
-def test_a_failure_with_j_1_stops_at_once(monkeypatch: pytest.MonkeyPatch):
+def test_a_failure_with_j_1_does_not_stop_the_next_copies(
+    monkeypatch: pytest.MonkeyPatch,
+):
     recorder = Recorder()
 
     def fail():
@@ -1758,8 +1771,8 @@ def test_a_failure_with_j_1_stops_at_once(monkeypatch: pytest.MonkeyPatch):
     with pytest.raises(IOError, match="the drive said no"):
         run_cp(monkeypatch, ["-j", "1", "folder/*", "dest"], resolved)
 
-    assert flatten(dest) == {"a.csv": b"a"}
-    assert recorder.started() == ["a.csv", "bad.csv"]
+    assert flatten(dest) == {"a.csv": b"a", "late.csv": b"late"}
+    assert recorder.started() == ["a.csv", "bad.csv", "late.csv"]
 
 
 def test_ctrl_c_stops_the_copies_and_removes_their_partial_files(
@@ -2805,7 +2818,7 @@ def test_log_messages_stay_complete_above_the_progress_display(
     assert sorted(rows[:2]) == ["Copying bad.csv", "Copying slow.csv"]
     assert rows[2:] == [
         "Failed to copy bad.csv: the drive said no",
-        "Copied 1 of 2 files and stopped after a failure",
+        "Copied 1 of 2 files. 1 failed.",
     ]
 
 
