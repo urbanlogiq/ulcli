@@ -8,6 +8,7 @@ import gzip
 import hashlib
 import http.server
 import io
+import itertools
 import os
 import re
 import signal
@@ -29,6 +30,7 @@ from typing import (
     List,
     NoReturn,
     Optional,
+    Sequence,
     Tuple,
     cast,
 )
@@ -45,16 +47,19 @@ from ulcli.commands.drive.progress import Progress
 from ulsdk.api_key_context import ApiKeyContext
 from ulsdk.keys import Environment, Key, Region
 from ulsdk.request_context import RequestContext
+from ulsdk.types.crypto import Digest
 from ulsdk.types.fs import (
+    Chunk,
     DirectoryEntry,
     DirectoryList,
     Entry,
+    File,
     ListEntry,
     ListFile,
     ListSlot,
     TopLevelDirectory,
 )
-from ulsdk.types.id import ObjectId
+from ulsdk.types.id import GenericId, ObjectId
 from ulsdk.types.object import DataCatalogObject
 
 
@@ -139,13 +144,6 @@ def source_tree() -> FakeEntry:
     nested = geo.add(FakeEntry("nested", True))
     nested.add(FakeEntry("deep.geojson", False, b"deep"))
     return root
-
-
-@pytest.fixture(autouse=True)
-def no_retry_wait(monkeypatch: pytest.MonkeyPatch):
-    """Do not wait between the requests of one download."""
-
-    monkeypatch.setattr(cp, "DOWNLOAD_RETRY_SECONDS", 0.0)
 
 
 @pytest.fixture(autouse=True)
@@ -433,6 +431,19 @@ def entry_object(parent: uuid.UUID) -> DataCatalogObject:
     obj = DataCatalogObject.make_default()
     entry = DirectoryEntry(Entry.make_default(), ObjectId.from_uuid(parent))
     obj.obj = entry.to_bytes()
+    return obj
+
+
+def file_object(block_sizes: Sequence[int]) -> DataCatalogObject:
+    """The data catalog object of a file with one block of each size."""
+
+    file = File.make_default()
+    file.chunks = [
+        Chunk(GenericId.make_default(), Digest.make_default(), size)
+        for size in block_sizes
+    ]
+    obj = DataCatalogObject.make_default()
+    obj.obj = DirectoryEntry(Entry(file), ObjectId.from_uuid(PARENT_ID)).to_bytes()
     return obj
 
 
@@ -1249,6 +1260,246 @@ def test_read_drive_file_raises_the_error_status_of_the_drive(drive: FakeDrive):
         list(cp.read_drive_file(api_key_context(), FILE_ID, cp.BLOCK_SIZE))
 
 
+@pytest.mark.parametrize("status", [400, 403, 500])
+def test_read_drive_file_makes_one_request_for_an_error_status(
+    drive: FakeDrive, status: int
+):
+    drive.respond = respond_with(b"no", status=status)
+
+    with pytest.raises(HTTPError):
+        list(cp.read_drive_file(api_key_context(), FILE_ID, cp.BLOCK_SIZE))
+
+    assert len(drive.requests) == 1
+
+
+def test_read_drive_file_names_an_upload_that_did_not_complete(
+    monkeypatch: pytest.MonkeyPatch, drive: FakeDrive
+):
+    drive.respond = respond_with(b"Unable to find entry", status=404)
+    monkeypatch.setattr(
+        cp, "get_object", lambda context, id: file_object([4, 4, 0, 0, 0])
+    )
+
+    with pytest.raises(OSError, match="The drive has 2 of 5 blocks") as failure:
+        list(cp.read_drive_file(api_key_context(), FILE_ID, cp.BLOCK_SIZE))
+
+    assert str(failure.value) == (
+        "The upload of this file did not complete. The drive has 2 of 5 blocks."
+    )
+    assert type(failure.value) is OSError
+    assert isinstance(failure.value.__cause__, HTTPError)
+    assert len(drive.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "entry", [file_object([4, 4]), file_object([]), entry_object(PARENT_ID)]
+)
+def test_read_drive_file_keeps_the_error_status_of_a_complete_file(
+    monkeypatch: pytest.MonkeyPatch, drive: FakeDrive, entry: DataCatalogObject
+):
+    drive.respond = respond_with(b"no such file", status=404)
+    monkeypatch.setattr(cp, "get_object", lambda context, id: entry)
+
+    with pytest.raises(HTTPError, match="404 Client Error"):
+        list(cp.read_drive_file(api_key_context(), FILE_ID, cp.BLOCK_SIZE))
+
+
+TAG = '"0500f1d0-5d3a-4d0c-9f3e-0c6f1b7a2e11"'
+
+
+def respond_like_the_drive(
+    body: bytes, limits: Sequence[int] = (), tag: Optional[str] = TAG
+) -> Callable[[http.server.BaseHTTPRequestHandler], None]:
+    """Answer as the drive does. Send the bytes from the start of `Range` if
+    `If-Range` has `tag`. If not, send the complete file.
+
+    For request number `n`, send at most `limits[n]` bytes of the content.
+    Then drop the connection."""
+
+    numbers = itertools.count()
+
+    def respond(handler: http.server.BaseHTTPRequestHandler):
+        number = next(numbers)
+        start = 0
+        requested = handler.headers["Range"]
+        if requested and tag is not None and handler.headers["If-Range"] == tag:
+            start = int(requested.removeprefix("bytes=").removesuffix("-"))
+        content = body[start:]
+        handler.send_response(206 if start else 200)
+        handler.send_header("Content-Length", str(len(content)))
+        if tag is not None:
+            handler.send_header("ETag", tag)
+        if start:
+            end, size = len(body) - 1, len(body)
+            handler.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        handler.end_headers()
+        if number < len(limits):
+            handler.wfile.write(content[: limits[number]])
+            handler.close_connection = True
+        else:
+            handler.wfile.write(content)
+
+    return respond
+
+
+def respond_in_turn(
+    *responders: Callable[[http.server.BaseHTTPRequestHandler], None],
+) -> Callable[[http.server.BaseHTTPRequestHandler], None]:
+    """Answer each request with the next responder. Repeat the last one."""
+
+    remaining = list(responders)
+
+    def respond(handler: http.server.BaseHTTPRequestHandler):
+        responder = remaining.pop(0) if len(remaining) > 1 else remaining[0]
+        responder(handler)
+
+    return respond
+
+
+def sent_ranges(drive: FakeDrive) -> List[Tuple[Optional[str], Optional[str]]]:
+    """Return the `Range` and `If-Range` headers of each request."""
+
+    ranges = []
+    for _, headers in drive.requests:
+        lowered = {name.lower(): value for name, value in headers.items()}
+        ranges.append((lowered.get("range"), lowered.get("if-range")))
+    return ranges
+
+
+def test_read_drive_file_continues_after_a_response_that_ends_early(drive: FakeDrive):
+    body = os.urandom(2 * cp.BLOCK_SIZE + 123)
+    drive.respond = respond_like_the_drive(body, limits=[cp.BLOCK_SIZE])
+
+    pieces = list(cp.read_drive_file(api_key_context(), FILE_ID, cp.BLOCK_SIZE))
+
+    assert b"".join(pieces) == body
+    assert sent_ranges(drive) == [(None, None), (f"bytes={cp.BLOCK_SIZE}-", TAG)]
+
+
+def test_read_drive_file_continues_as_long_as_content_arrives(drive: FakeDrive):
+    requests_with_content = cp.DOWNLOAD_ATTEMPTS + 2
+    body = os.urandom(requests_with_content * cp.BLOCK_SIZE)
+    limits = [cp.BLOCK_SIZE] * (requests_with_content - 1)
+    drive.respond = respond_like_the_drive(body, limits)
+
+    pieces = list(cp.read_drive_file(api_key_context(), FILE_ID, cp.BLOCK_SIZE))
+
+    assert b"".join(pieces) == body
+    assert [start for start, _ in sent_ranges(drive)] == [None] + [
+        f"bytes={number * cp.BLOCK_SIZE}-" for number in range(1, requests_with_content)
+    ]
+
+
+def test_read_drive_file_starts_again_if_no_content_arrived(drive: FakeDrive):
+    body = os.urandom(cp.BLOCK_SIZE + 5)
+    drive.respond = respond_like_the_drive(body, limits=[0, 0])
+
+    pieces = list(cp.read_drive_file(api_key_context(), FILE_ID, cp.BLOCK_SIZE))
+
+    assert b"".join(pieces) == body
+    assert sent_ranges(drive) == [(None, None)] * 3
+
+
+def test_read_drive_file_stops_after_failures_in_a_row_without_content(
+    monkeypatch: pytest.MonkeyPatch, drive: FakeDrive
+):
+    body = os.urandom(2 * cp.BLOCK_SIZE)
+    limits = [cp.BLOCK_SIZE] + [0] * cp.DOWNLOAD_ATTEMPTS
+    drive.respond = respond_like_the_drive(body, limits)
+    waits: List[float] = []
+    monkeypatch.setattr(cp, "DOWNLOAD_RETRY_SECONDS", 1.0)
+    monkeypatch.setattr(cp.time, "sleep", waits.append)
+    blocks = cp.read_drive_file(api_key_context(), FILE_ID, cp.BLOCK_SIZE)
+
+    assert next(blocks) == body[: cp.BLOCK_SIZE]
+    with pytest.raises(requests.RequestException):
+        next(blocks)
+
+    assert len(drive.requests) == cp.DOWNLOAD_ATTEMPTS
+    assert waits == [1.0, 2.0, 4.0, 8.0, 16.0]
+
+
+def test_read_drive_file_fails_if_the_file_changed(drive: FakeDrive):
+    body = os.urandom(2 * cp.BLOCK_SIZE)
+    drive.respond = respond_in_turn(
+        respond_like_the_drive(body, limits=[cp.BLOCK_SIZE]),
+        respond_like_the_drive(os.urandom(len(body)), tag='"new"'),
+    )
+    blocks = cp.read_drive_file(api_key_context(), FILE_ID, cp.BLOCK_SIZE)
+
+    assert next(blocks) == body[: cp.BLOCK_SIZE]
+    with pytest.raises(OSError, match="File changed during the copy") as failure:
+        next(blocks)
+
+    assert type(failure.value) is OSError
+    assert sent_ranges(drive) == [(None, None), (f"bytes={cp.BLOCK_SIZE}-", TAG)]
+
+
+@pytest.mark.parametrize("status, start", [(206, 5), (200, cp.BLOCK_SIZE)])
+def test_read_drive_file_checks_the_status_and_start_of_the_remaining_bytes(
+    drive: FakeDrive, status: int, start: int
+):
+    body = os.urandom(2 * cp.BLOCK_SIZE)
+    wrong = respond_with(
+        body[start:],
+        status=status,
+        headers={"Content-Range": f"bytes {start}-{len(body) - 1}/{len(body)}"},
+    )
+    drive.respond = respond_in_turn(
+        respond_like_the_drive(body, limits=[cp.BLOCK_SIZE]), wrong
+    )
+    blocks = cp.read_drive_file(api_key_context(), FILE_ID, cp.BLOCK_SIZE)
+
+    assert next(blocks) == body[: cp.BLOCK_SIZE]
+    with pytest.raises(OSError, match="File changed during the copy"):
+        next(blocks)
+
+
+@pytest.mark.parametrize("tag", [None, 'W/"weak"'])
+def test_read_drive_file_does_not_continue_without_a_strong_tag(
+    drive: FakeDrive, tag: Optional[str]
+):
+    body = os.urandom(2 * cp.BLOCK_SIZE)
+    drive.respond = respond_like_the_drive(body, limits=[cp.BLOCK_SIZE], tag=tag)
+    blocks = cp.read_drive_file(api_key_context(), FILE_ID, cp.BLOCK_SIZE)
+
+    assert next(blocks) == body[: cp.BLOCK_SIZE]
+    with pytest.raises(requests.RequestException):
+        next(blocks)
+
+    assert len(drive.requests) == 1
+
+
+@pytest.mark.parametrize("status", [502, 503, 504])
+def test_read_drive_file_tries_again_after_a_gateway_error(
+    drive: FakeDrive, status: int
+):
+    drive.respond = respond_in_turn(
+        respond_with(b"not available", status=status), respond_with(b"abc")
+    )
+
+    assert b"".join(cp.read_drive_file(api_key_context(), FILE_ID, 4)) == b"abc"
+
+    assert len(drive.requests) == 2
+
+
+def test_read_drive_file_tries_again_after_a_timeout(monkeypatch: pytest.MonkeyPatch):
+    answers: List[object] = [requests.Timeout("no answer"), io.BytesIO(b"abc")]
+
+    def fake_get_file_stream(*args: object, **kwargs: object) -> object:
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(cp, "get_file_stream", fake_get_file_stream)
+
+    pieces = list(cp.read_drive_file(cast(RequestContext, None), FILE_ID, 4))
+
+    assert pieces == [b"abc"]
+    assert answers == []
+
+
 def respond_with_a_short_body(handler: http.server.BaseHTTPRequestHandler):
     """Promise 1000 bytes, send 10, and drop the connection."""
 
@@ -1318,6 +1569,66 @@ def test_download_streams_from_the_drive_to_the_local_file(
 
     assert (tmp_path / "a.bin").read_bytes() == body
     assert os.listdir(tmp_path) == ["a.bin"]
+
+
+def test_download_that_ends_early_continues_into_the_same_file(
+    monkeypatch: pytest.MonkeyPatch, drive: FakeDrive, tmp_path: Path
+):
+
+    body = os.urandom(3 * cp.BLOCK_SIZE + 17)
+    drive.respond = respond_like_the_drive(body, limits=[cp.BLOCK_SIZE] * 2)
+    monkeypatch.setattr(cp, "get_api_context", lambda parsed: api_key_context())
+    monkeypatch.setattr(cp, "get_object", lambda context, id: entry_object(PARENT_ID))
+    monkeypatch.setattr(
+        cp,
+        "ls",
+        lambda context, root, tail: DirectoryList(
+            [file_slot(FILE_ID, "a.bin", size=len(body))]
+        ),
+    )
+
+    assert cp.drive_cp([str(FILE_ID), str(tmp_path)])
+
+    assert (tmp_path / "a.bin").read_bytes() == body
+    assert os.listdir(tmp_path) == ["a.bin"]
+    assert len(drive.requests) == 3
+
+
+@pytest.mark.parametrize("jobs", ["1", "3"])
+def test_an_upload_that_did_not_complete_does_not_stop_the_other_downloads(
+    monkeypatch: pytest.MonkeyPatch,
+    drive: FakeDrive,
+    tmp_path: Path,
+    log: List[str],
+    jobs: str,
+):
+    def respond(handler: http.server.BaseHTTPRequestHandler):
+        if str(OTHER_ID) in handler.path:
+            respond_with(b"Unable to find entry", status=404)(handler)
+        else:
+            respond_with(b"abc")(handler)
+
+    drive.respond = respond
+    slots = [
+        file_slot(FILE_ID, "a.csv"),
+        file_slot(OTHER_ID, "b.csv"),
+        file_slot(PARENT_ID, "c.csv"),
+    ]
+    monkeypatch.setattr(cp, "get_api_context", lambda parsed: api_key_context())
+    monkeypatch.setattr(cp, "get_object", lambda context, id: file_object([3, 0]))
+    monkeypatch.setattr(cp, "ls", lambda context, root, tail: DirectoryList(slots))
+
+    with pytest.raises(OSError, match="The drive has 1 of 2 blocks"):
+        cp.drive_cp(["-j", jobs, f"{PARENT_ID}:/*", str(tmp_path)])
+
+    assert sorted(os.listdir(tmp_path)) == ["a.csv", "c.csv"]
+    assert (tmp_path / "a.csv").read_bytes() == b"abc"
+    assert (tmp_path / "c.csv").read_bytes() == b"abc"
+    assert (
+        "Failed to copy b.csv: The upload of this file did not complete."
+        " The drive has 1 of 2 blocks."
+    ) in log
+    assert "Copied 2 of 3 files. 1 failed." in log
 
 
 def test_a_copy_that_fails_closes_its_source(tmp_path: Path):
@@ -1731,6 +2042,75 @@ def test_a_failure_does_not_stop_the_other_copies(
     assert "Copied 3 of 4 files. 1 failed." in log
 
 
+@pytest.mark.parametrize("jobs", ["1", "2"])
+def test_the_first_of_several_failures_fails_the_command(
+    monkeypatch: pytest.MonkeyPatch, log: List[str], jobs: str
+):
+    recorder = Recorder()
+    first_failed = threading.Event()
+
+    def fail_first():
+        try:
+            raise IOError("first failure")
+        finally:
+            first_failed.set()
+
+    def fail_second():
+        wait_for(first_failed)
+        raise ValueError("second failure")
+
+    sources = [
+        ScriptedEntry("a.csv", b"a", recorder, fail_first),
+        ScriptedEntry("b.csv", b"b", recorder, fail_second),
+        ScriptedEntry("c.csv", b"c", recorder),
+    ]
+    dest = FakeEntry("dest", True)
+    resolved = [ResolvedArg(sources, True), ResolvedArg([dest], False)]
+
+    with pytest.raises(IOError, match="first failure"):
+        run_cp(monkeypatch, ["-j", jobs, "folder/*", "dest"], resolved)
+
+    assert flatten(dest) == {"c.csv": b"c"}
+    assert "Failed to copy b.csv: second failure" in log
+    assert "Copied 1 of 3 files. 2 failed." in log
+
+
+def test_an_error_that_is_not_a_file_failure_stops_new_copies(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class Fatal(BaseException):
+        pass
+
+    recorder = Recorder()
+    slow_started = threading.Event()
+    workers: List[threading.Thread] = []
+
+    def die():
+        wait_for(slow_started)
+        workers.append(threading.current_thread())
+        raise Fatal()
+
+    def finish_after_the_error():
+        slow_started.set()
+        wait_until(lambda: len(workers) == 1)
+        workers[0].join(WAIT_SECONDS)
+
+    sources = [
+        ScriptedEntry("bad.csv", b"bad", recorder, die),
+        ScriptedEntry("slow.csv", b"slow", recorder, finish_after_the_error),
+        ScriptedEntry("late.csv", b"late", recorder),
+        ScriptedEntry("later.csv", b"later", recorder),
+    ]
+    dest = FakeEntry("dest", True)
+    resolved = [ResolvedArg(sources, True), ResolvedArg([dest], False)]
+
+    with pytest.raises(Fatal):
+        run_cp(monkeypatch, ["-j", "2", "folder/*", "dest"], resolved)
+
+    assert flatten(dest) == {"slow.csv": b"slow"}
+    assert sorted(recorder.started()) == ["bad.csv", "slow.csv"]
+
+
 def test_a_worker_that_dies_of_anything_fails_the_command(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -1776,7 +2156,7 @@ def test_a_failure_with_j_1_does_not_stop_the_next_copies(
 
 
 def test_ctrl_c_stops_the_copies_and_removes_their_partial_files(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, log: List[str]
 ):
 
     monkeypatch.setattr(cp, "INTERRUPT_GRACE_SECONDS", 0.5)
@@ -1818,6 +2198,7 @@ def test_ctrl_c_stops_the_copies_and_removes_their_partial_files(
         assert os.listdir(tmp_path) == ["stuck.csv"]
         assert (tmp_path / "stuck.csv").read_bytes() == b"old content"
         assert stopped == ["streaming.csv"]
+        assert not [message for message in log if "Failed to copy" in message]
     finally:
         unstick.set()
 
